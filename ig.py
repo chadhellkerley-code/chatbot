@@ -914,6 +914,10 @@ _RETRYABLE_SEND_HINTS = (
 NO_DM_SKIP_REASON = "NO_DM_BUTTON"
 NO_DM_SKIP_DETAIL = "Perfil sin botón de mensaje / no permite DM"
 NO_DM_SKIP_LOG = f"skip | no_dm | {NO_DM_SKIP_DETAIL}"
+
+EXACT_USER_SKIP_REASON = "EXACT_USER_NOT_FOUND"
+EXACT_USER_SKIP_DETAIL = "No se encontró coincidencia exacta para el username"
+EXACT_USER_SKIP_LOG = f"skip | exact_match | {EXACT_USER_SKIP_DETAIL}"
 SENT_UNVERIFIED_REASON = "SENT_UNVERIFIED"
 SENT_UNVERIFIED_DETAIL = (
     "Se intentó enviar y no se pudo verificar en DOM; no cuenta como error"
@@ -1022,11 +1026,18 @@ def _handle_event(
 ) -> Optional[str]:
     username = event.username
     skip_reason = (event.reason_code or "").strip().upper()
-    if not event.success and skip_reason == NO_DM_SKIP_REASON:
+
+    # Manejo de skips (No DM o No match exacto)
+    if not event.success and skip_reason in (NO_DM_SKIP_REASON, EXACT_USER_SKIP_REASON):
         account_error_streaks.pop(username, None)
-        detail = event.detail or NO_DM_SKIP_DETAIL
+
+        is_exact_skip = (skip_reason == EXACT_USER_SKIP_REASON)
+        detail = event.detail or (EXACT_USER_SKIP_DETAIL if is_exact_skip else NO_DM_SKIP_DETAIL)
+        log_msg = EXACT_USER_SKIP_LOG if is_exact_skip else NO_DM_SKIP_LOG
+
         if no_dm_by_account is not None:
             no_dm_by_account[username] = int(no_dm_by_account.get(username, 0)) + 1
+
         _log_runner_event(
             "message",
             account=username,
@@ -1034,7 +1045,7 @@ def _handle_event(
             status="skipped",
             reason=detail,
         )
-        live_table.complete(username, True, NO_DM_SKIP_LOG)
+        live_table.complete(username, True, log_msg)
         log_sent(
             username,
             event.lead,
@@ -1048,10 +1059,11 @@ def _handle_event(
             cancelled=event.cancelled,
             verified=False,
             skip=True,
-            skip_reason=NO_DM_SKIP_REASON,
+            skip_reason=skip_reason,
         )
         bump("skipped_no_dm", 1)
-        emit_log(username, event.lead, "skip", f"no_dm | {detail}", None)
+        action_label = "exact_match_skip" if is_exact_skip else "no_dm"
+        emit_log(username, event.lead, "skip", f"{action_label} | {detail}", None)
         return None
     if event.success:
         account_error_streaks.pop(username, None)
