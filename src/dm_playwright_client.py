@@ -717,6 +717,15 @@ class PlaywrightDMClient:
             print(style_text(f"[PlaywrightDM] Timeout esperando hidratacion", color=Fore.YELLOW))
             pass
 
+        # DIAGNOSTICO: Probar selectores de nodos
+        print(style_text(f"[PlaywrightDM] Diagnostico de selectores de mensajes:", color=Fore.WHITE))
+        for selector in _MESSAGE_NODE_SELECTORS:
+            try:
+                count = page.locator(f"main {selector}, div[role='main'] {selector}").count()
+                print(style_text(f"  - {selector}: {count} encontrados", color=Fore.WHITE if count > 0 else Fore.YELLOW))
+            except Exception:
+                pass
+
         nodes = self._collect_message_nodes(page)
         total = nodes.count()
         if total <= 0:
@@ -727,6 +736,13 @@ class PlaywrightDMClient:
                     _thread_peer_id(thread, self.user_id),
                     self.username,
                 )
+            print(style_text(f"[PlaywrightDM] ERROR: No se encontraron mensajes en el thread {thread.id}", color=Fore.RED))
+            try:
+                # PROBE: Snippet del contenido de main
+                main_text = (page.locator("main, div[role='main']").first.inner_text() or "").strip()
+                print(style_text(f"[PlaywrightDM] Contenido de main (primeros 200 chars): {main_text[:200]}", color=Fore.YELLOW))
+            except Exception:
+                pass
             return []
 
         start_idx = max(0, total - max(1, amount))

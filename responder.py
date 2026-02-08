@@ -1274,7 +1274,8 @@ def _process_followups(
     threads_limit: int = 15,
     followup_schedule_hours: Optional[List[int]] = None,
 ) -> None:
-    _load_all_conversations_to_memory(client, user, max_age_days, threads_limit=threads_limit)
+    # Para Playwright omitimos el pre-cargado redundante de toda la memoria.
+    # _load_all_conversations_to_memory(client, user, max_age_days, threads_limit=threads_limit)
     
     alias, entry = _followup_enabled_entry_for(user)
     if not alias or not entry or not entry.get("enabled"):
@@ -4892,6 +4893,12 @@ def _process_inbox(
         logger.debug("PlaywrightDM processing thread %s", thread_id)
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
+
+        # PERSISTENCIA INMEDIATA: Sincronizar memoria apenas se identifica el thread
+        recipient_username = _resolve_username(client, thread, None)
+        print(style_text(f"[Persistencia] Sincronización INICIAL para @{recipient_username} (Thread: {thread_id})", color=Fore.WHITE))
+        _update_conversation_state(user, thread_id, {"updated_at": time.time()}, recipient_username=recipient_username)
+
         messages = client.get_messages(thread, amount=10)
         if not messages:
             print(style_text(f"[Barrido] Thread {thread_id} sin mensajes (omitido)", color=Fore.YELLOW))
