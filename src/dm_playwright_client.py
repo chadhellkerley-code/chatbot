@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+from ui import Fore, style_text
+
 try:  # pragma: no cover - optional dependency guard
     from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 except Exception:  # pragma: no cover
@@ -44,11 +46,15 @@ _MESSAGE_CONTAINER_SELECTORS = (
 _MESSAGE_NODE_SELECTORS = (
     "[data-testid='message-bubble']",
     "div[role='row']",
+    "div[role='none']",
+    "div[dir='auto']",
 )
 _COMPOSER_SELECTORS = (
     "div[role='main'] div[role='textbox'][contenteditable='true']",
     "div[role='main'] div[contenteditable='true'][role='textbox']",
     "div[role='main'] textarea",
+    "div[role='textbox'][contenteditable='true']",
+    "div[contenteditable='true']",
 )
 
 _UNREAD_HINTS = ("unread", "sin leer", "no leido", "no leido")
@@ -77,6 +83,7 @@ class MessageLike:
     user_id: str
     text: str
     timestamp: Optional[float]
+    direction: str = "inbound"  # "inbound" or "outbound"
 
 
 class PlaywrightDMClient:
@@ -84,8 +91,8 @@ class PlaywrightDMClient:
         self,
         *,
         account: Optional[dict] = None,
-        headless: bool = True,
-        slow_mo_ms: int = 0,
+        headless: bool = False,
+        slow_mo_ms: int = 1000,
         dump_on_error: bool = True,
     ) -> None:
         if sync_playwright is None:
@@ -162,322 +169,63 @@ class PlaywrightDMClient:
         self._open_inbox()
 
     def list_threads(self, amount: int = 20, filter_unread: bool = False) -> List[ThreadLike]:
+        """
+        Discovery de inbox: Retorna lista de threads visibles sin abrirlos aún.
+        """
         page = self._ensure_page()
         self._open_inbox()
-        try:
-            inbox_panel, panel_method, search_selector_used, panel_counts = self._get_inbox_panel(page)
-            # Usar el selector real que devolvió el panel, no ROW_SELECTOR broad
-            try:
-                actual_selector = (panel_counts.get("row_selector") or ROW_SELECTOR) if panel_counts else ROW_SELECTOR
-                count_rows = inbox_panel.locator(actual_selector).count() if inbox_panel is not None else 0
-            except Exception:
-                count_rows = 0
-            
-            # Calcular valid_rows usando _count_rows_valid sobre el selector elegido
-            valid_rows = 0
-            try:
-                if inbox_panel is not None and actual_selector:
-                    rows_locator = inbox_panel.locator(actual_selector)
-                    valid_rows = self._count_rows_valid(rows_locator)
-            except Exception:
-                valid_rows = 0
-            
-            logger.info(
-                "PlaywrightDM inbox_panel_selected=%s panel_level=%s row_selector=%s search_selector_used=%s count_rows=%s valid_rows=%s rows_raw=%s rows_valid=%s",
-                panel_method,
-                panel_counts.get("level", 0),
-                panel_counts.get("row_selector", ""),
-                search_selector_used,
-                count_rows,
-                valid_rows,
-                panel_counts.get("raw", 0),
-                panel_counts.get("valid", 0),
-            )
 
-            threads = self._scan_threads_click_first(amount, filter_unread, inbox_panel, panel_counts)
+        selector_candidates = self._row_selector_candidates()
 
-            logger.info(
-                "PlaywrightDM list_threads account=@%s count=%d filter_unread=%s",
-                self.username,
-                len(threads),
-                filter_unread,
-            )
-            if not threads and self.dump_on_error:
-                dump_path = self.debug_dump_inbox("list_threads_zero_or_exception")
-                logger.info("Se genero dump: %s", dump_path or "-")
-            return threads
-        except Exception:
-            if self.dump_on_error:
-                dump_path = self.debug_dump_inbox("list_threads_zero_or_exception")
-                logger.info("Se genero dump: %s", dump_path or "-")
-            raise
-
-    def _scan_threads_click_first(
-        self,
-        amount: int,
-        filter_unread: bool,
-        inbox_panel,
-        panel_counts: dict,
-    ) -> List[ThreadLike]:
-        page = self._ensure_page()
-        panel = inbox_panel or page
-        primary_selector = (panel_counts or {}).get("row_selector") or ROW_SELECTOR
-        selector_candidates: List[str] = []
-        if primary_selector:
-            selector_candidates.append(primary_selector)
-        for selector in self._row_selector_candidates():
-            if selector not in selector_candidates:
-                selector_candidates.append(selector)
-
-        rows = None
-        row_selector_used = ""
-        rows_total_raw = 0
-        for selector in selector_candidates:
-            try:
-                candidate = panel.locator(selector)
-                count = candidate.count()
-            except Exception:
-                count = 0
-                candidate = None
-            if count > 0 and candidate is not None:
-                rows = candidate
-                row_selector_used = selector
-                rows_total_raw = count
-                break
-        if rows is None:
-            rows = panel.locator(selector_candidates[-1])
-            row_selector_used = selector_candidates[-1]
-            try:
-                rows_total_raw = rows.count()
-            except Exception:
-                rows_total_raw = 0
-
-        logger.info(
-            "PlaywrightDM row_selector_used=%s rows_total_raw=%d account=@%s",
-            row_selector_used,
-            rows_total_raw,
-            self.username,
-        )
+        print(style_text(f"[Probe] Iniciando list_threads en {page.url}", color=Fore.WHITE))
 
         threads: List[ThreadLike] = []
-        seen: set[str] = set()
-        max_scrolls = 10
-        scrolls = 0
+        seen_titles = set()
 
-        def _first_row_line(loc) -> str:
+        for selector in selector_candidates:
             try:
-                if loc.count() <= 0:
-                    return ""
-                text = (loc.nth(0).inner_text() or "").strip()
-            except Exception:
-                return ""
-            if not text:
-                return ""
-            return text.splitlines()[0].strip()[:120]
-
-        while len(threads) < amount and scrolls <= max_scrolls:
-            try:
+                rows = page.locator(selector)
                 total = rows.count()
+                print(style_text(f"[Probe] Selector '{selector}' -> count={total}", color=Fore.WHITE))
+                if total == 0:
+                    continue
+
+                for idx in range(total):
+                    if len(threads) >= amount:
+                        break
+
+                    row = rows.nth(idx)
+                    if not self._row_is_valid(row):
+                        continue
+
+                    if filter_unread and _thread_unread_count(row) <= 0:
+                        continue
+
+                    lines = self._row_lines(row)
+                    title = lines[0] if lines else "unknown"
+                    if title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+
+                    # ID Estable recomendado: account:recipient
+                    stable_id = f"{self.username}:{title}"
+
+                    thread = ThreadLike(
+                        id=stable_id,
+                        pk=stable_id,
+                        users=[UserLike(pk=title, id=title, username=title)],
+                        title=title,
+                    )
+                    # Guardar meta para poder encontrarlo luego por título
+                    self._thread_cache[stable_id] = thread
+                    self._thread_cache_meta[stable_id] = {"title": title, "idx": idx, "selector": selector}
+                    threads.append(thread)
+
+                if threads:
+                    break
             except Exception:
-                total = 0
-            if total <= 0:
-                break
+                continue
 
-            idx = 0
-            while idx < total and len(threads) < amount:
-                row_idx = idx
-                row = rows.nth(row_idx)
-                lines = self._row_lines(row)
-                first_line = lines[0] if lines else ""
-                if not lines:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_text",
-                        row_idx,
-                    )
-                    idx += 1
-                    continue
-                lowered = first_line.strip().lower()
-                if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje"}:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=header_tab first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-                if not self._row_is_valid(row):
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=row_invalid first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-                if filter_unread and _thread_unread_count(row) <= 0:
-                    idx += 1
-                    continue
-                try:
-                    row.scroll_into_view_if_needed(timeout=2_000)
-                except Exception:
-                    pass
-                try:
-                    row.click()
-                except Exception:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=click_failed first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-
-                # DIAGNOSTICO: Verificar estado inmediatamente tras click
-                self._log_navigation_state("POST_CLICK")
-
-                opened = self._wait_thread_open(page)
-                composer = self._find_composer(page) if opened else None
-                if composer is None:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_composer first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-
-                title = _extract_header_title(page) or first_line
-                peer_username = _extract_header_username(page, self.username) or title
-                method = "stable"
-                thread_key = ""
-                link = ""
-                if "/direct/t/" in (page.url or ""):
-                    thread_id = _extract_thread_id(page.url)
-                    if thread_id:
-                        thread_key = thread_id
-                        method = "real_url"
-                        link = _normalize_direct_link(page.url)
-                if not thread_key:
-                    base = _normalize_key_source(title)
-                    peer_norm = _normalize_key_source(peer_username)
-                    if base and peer_norm:
-                        base = f"{base}|{peer_norm}"
-                    elif not base:
-                        base = peer_norm or _normalize_key_source(first_line)
-                    if base:
-                        stable_id = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
-                        thread_key = f"stable_{stable_id}"
-                if not thread_key:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_thread_key first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-                if thread_key in seen:
-                    idx += 1
-                    continue
-                seen.add(thread_key)
-                recipient = title or peer_username or thread_key
-                user = UserLike(pk=recipient, id=recipient, username=recipient)
-                thread = ThreadLike(
-                    id=thread_key,
-                    pk=thread_key,
-                    users=[user],
-                    unread_count=_thread_unread_count(row),
-                    link=link,
-                    title=title or recipient,
-                )
-                threads.append(thread)
-                self._thread_cache[thread_key] = thread
-                self._thread_cache_meta[thread_key] = {
-                    "title": title or "",
-                    "peer_username": peer_username or "",
-                    "row_index": row_idx,
-                    "row_selector": row_selector_used,
-                    "created_at": time.time(),
-                }
-                logger.info(
-                    "PlaywrightDM thread_capture idx=%d key=%s method=%s title=%s peer=%s composer_ok=%s",
-                    row_idx,
-                    thread_key,
-                    method,
-                    title or "",
-                    peer_username or "",
-                    True,
-                )
-                idx += 1
-
-            if len(threads) >= amount:
-                break
-            scrolls += 1
-            try:
-                rows_count_before = rows.count()
-            except Exception:
-                rows_count_before = 0
-            first_line_before = _first_row_line(rows)
-            
-            # Identificar el contenedor scrollable real (scrollHeight > clientHeight)
-            scroll_container = self._find_scroll_container(page, panel)
-            
-            # Capturar scrollTop antes del scroll
-            scroll_top_before = 0
-            scroll_top_after = 0
-            
-            # Scroll usando evaluate sobre el contenedor correcto
-            try:
-                if scroll_container:
-                    scroll_top_before = scroll_container.evaluate("el => el.scrollTop")
-                    scroll_container.evaluate("el => el.scrollTop += 1400")
-                    scroll_top_after = scroll_container.evaluate("el => el.scrollTop")
-                else:
-                    # Fallback a mouse wheel si no se encuentra contenedor scrollable
-                    # Intentar hover sobre el panel con position para mejor targeting
-                    try:
-                        box = panel.bounding_box()
-                        if box:
-                            # Hover en el centro del panel
-                            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                        else:
-                            panel.hover()
-                    except Exception:
-                        try:
-                            panel.hover()
-                        except Exception:
-                            pass
-                    page.mouse.wheel(0, 1400)
-            except Exception:
-                pass
-            
-            try:
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-            try:
-                rows = panel.locator(row_selector_used)
-                rows_count_after = rows.count()
-            except Exception:
-                rows_count_after = 0
-            first_line_after = _first_row_line(rows)
-            logger.info(
-                "PlaywrightDM scroll_attempt=%d row_selector=%s rows_count_before=%d rows_count_after=%d scrollTop_before=%d scrollTop_after=%d first_line_before=%s first_line_after=%s",
-                scrolls,
-                row_selector_used,
-                rows_count_before,
-                rows_count_after,
-                scroll_top_before,
-                scroll_top_after,
-                first_line_before,
-                first_line_after,
-            )
-
-        if len(threads) < amount:
-            logger.warning(
-                "PlaywrightDM no hay suficientes threads validos despues de %d scrolls (encontrados=%d requeridos=%d)",
-                scrolls,
-                len(threads),
-                amount,
-            )
         return threads
 
     # LEGACY: Función deshabilitada - ya no se usa (reemplazada por click-first scan)
@@ -492,6 +240,9 @@ class PlaywrightDMClient:
 
     def _row_selector_candidates(self) -> List[str]:
         return [
+            "a[href*='/direct/t/']",
+            "div[aria-label='Chats'] div[role='button']",
+            "div[aria-label='Mensajes'] div[role='button']",
             "div[role='main'] div[role='listitem']",
             "div[role='main'] div[role='row']",
             "div[role='listitem']",
@@ -500,53 +251,97 @@ class PlaywrightDMClient:
             "div[role='button'][tabindex='0']",
         ]
 
+    def _get_inbox_panel(self, page: Page):
+        """
+        [Probe/Fix] Intenta encontrar el panel lateral de mensajes.
+        Retorna (locator, metodo, selector, meta).
+        """
+        for selector in ("div[role='main']", "main", "div[role='navigation']"):
+            try:
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    print(style_text(f"[Probe] _get_inbox_panel encontró '{selector}'", color=Fore.WHITE))
+                    return loc.first, "selector", selector, {"count": loc.count()}
+            except Exception:
+                continue
+        print(style_text("[Probe] _get_inbox_panel no encontró nada, usando page", color=Fore.YELLOW))
+        return page, "page", "", {"count": 1}
+
     def _row_is_valid(self, row) -> bool:
         lines = self._row_lines(row)
         if not lines:
             return False
         first_line = lines[0].strip()
         lowered = first_line.lower()
-        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje"}:
+
+        # [CRÍTICO] Un thread DM real DEBE tener un enlace a /direct/t/
+        # Las burbujas de Notas no suelen tener este enlace directo.
+        valid_href = False
+        try:
+            # 1. ¿El elemento mismo es el link?
+            href = row.get_attribute("href") or ""
+            if "/direct/t/" in href:
+                valid_href = True
+            # 2. ¿Contiene un link?
+            elif row.locator("a[href*='/direct/t/']").count() > 0:
+                valid_href = True
+        except Exception:
+            pass
+
+        if not valid_href:
+            print(style_text(f"[Probe] Fila rechazada (sin link DM): '{first_line[:30]}...'", color=Fore.YELLOW))
             return False
-        # Tokens específicos de UI de Notas (removido "nota" singular suelto para evitar falsos positivos)
-        notes_tokens = ("tu nota", "primera nota", "compartir una nota", "notas", "notes", "share a note")
-        # Aplicar filtro principalmente sobre first_line para evitar falsos descartes por snippet
+
+        # Filtros de exclusión conocidos (headers, tabs, botones de búsqueda)
+        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje", "solicitudes", "principal"}:
+            print(style_text(f"[Probe] Fila rechazada (filtro texto): '{first_line}'", color=Fore.YELLOW))
+            return False
+
+        # Tokens específicos de UI de Notas
+        notes_tokens = ("tu nota", "primera nota", "compartir una nota", "notas", "notes", "share a note", "nota de")
         if any(token in lowered for token in notes_tokens):
+            print(style_text(f"[Probe] Fila rechazada (filtro Notas): '{first_line}'", color=Fore.YELLOW))
             return False
+
         try:
             aria = (row.get_attribute("aria-label") or "").lower()
             if any(token in aria for token in notes_tokens):
+                print(style_text(f"[Probe] Fila rechazada (filtro Notas aria): '{first_line}'", color=Fore.YELLOW))
                 return False
         except Exception:
             pass
+
+        # RELAXED VALIDATION: Priorizamos la existencia de señales de interacción real
         signals = 0
         try:
+            # Señal 1: Presencia de timestamp real (etiqueta <time>)
             if row.locator("time").count() > 0:
                 signals += 1
+            else:
+                # Buscar patrones de tiempo más específicos (ej: "2 h", "5 min", "1 d")
+                # Evitamos matches genéricos de una sola letra
+                full_text = " ".join(lines)
+                if re.search(r"\b\d+\s*[hdmws]\b", full_text) or re.search(r"\b\d+\s*(min|seg|hor|dia|sem)\b", full_text):
+                    signals += 1
         except Exception:
             pass
+
         try:
+            # Señal 2: Indicadores de mensajes no leídos
             aria = (row.get_attribute("aria-label") or "").lower()
-            if any(token in aria for token in _UNREAD_HINTS):
+            if any(token in aria for token in _UNREAD_HINTS) or row.locator("span[aria-label*='unread']").count() > 0:
                 signals += 1
         except Exception:
             pass
-        try:
-            if row.locator("span[aria-label*='unread'], span[aria-label*='sin leer'], span[aria-label*='no leido']").count():
-                signals += 1
-        except Exception:
-            pass
-        try:
-            if row.locator("div[dir='auto'], span[dir='auto']").count() > 1:
-                signals += 1
-        except Exception:
-            pass
-        if len(lines) >= 2 and signals >= 1:
-            return True
-        if len(lines) == 1 and signals >= 1:
+
+        # PROBE LOG: Para diagnosticar por qué se aceptan o rechazan filas
+        if len(lines) >= 1:
+            # Si tiene al menos una línea y pasó los filtros críticos, es válido.
+            logger.debug("PlaywrightDM checking row: first_line=%s signals=%d", first_line[:30], signals)
+            print(style_text(f"[Probe] Fila aceptada: '{first_line}' (signals={signals})", color=Fore.GREEN))
             return True
 
-        logger.info("PlaywrightDM row_is_valid=False first_line=%s signals=%d lines_count=%d", first_line[:50], signals, len(lines))
+        logger.info("PlaywrightDM row_is_valid=False first_line=%s reason=no_content", first_line[:50])
         return False
 
     def _count_rows_valid(self, rows) -> int:
@@ -566,95 +361,17 @@ class PlaywrightDMClient:
     # LEGACY: Función deshabilitada - ya no se usa (reemplazada por click-first scan)
     # def _list_threads_from_rows(...) -> List[ThreadLike]
 
-    def _find_scroll_container(self, page: Page, panel):
-        """
-        Identifica el contenedor scrollable real dentro del panel.
-        Validaciones:
-        1. scrollHeight > clientHeight
-        2. overflowY in ('auto', 'scroll')
-        3. Probe: scrollTop cambia al incrementarlo
-        Si no pasa probe, continúa buscando en children.
-        Retorna el primer ElementHandle scrollable válido o None.
-        """
-        try:
-            # Usar evaluate_handle para obtener un DOM element (no serializable)
-            handle = panel.evaluate_handle("""
-                (panel) => {
-                    const findScrollable = (el) => {
-                        // Validar scrollHeight > clientHeight
-                        if (el.scrollHeight <= el.clientHeight) {
-                            // Buscar en children
-                            for (let child of el.children) {
-                                const scrollable = findScrollable(child);
-                                if (scrollable) return scrollable;
-                            }
-                            return null;
-                        }
-                        
-                        // Validar overflowY
-                        const style = window.getComputedStyle(el);
-                        const overflowY = style.overflowY;
-                        if (overflowY !== 'auto' && overflowY !== 'scroll') {
-                            // Buscar en children
-                            for (let child of el.children) {
-                                const scrollable = findScrollable(child);
-                                if (scrollable) return scrollable;
-                            }
-                            return null;
-                        }
-                        
-                        // Probe: verificar que scrollTop cambie
-                        const originalScrollTop = el.scrollTop;
-                        el.scrollTop += 1;
-                        const newScrollTop = el.scrollTop;
-                        el.scrollTop = originalScrollTop; // Restaurar
-                        
-                        if (newScrollTop === originalScrollTop) {
-                            // scrollTop no cambió, seguir buscando
-                            for (let child of el.children) {
-                                const scrollable = findScrollable(child);
-                                if (scrollable) return scrollable;
-                            }
-                            return null;
-                        }
-                        
-                        // Todas las validaciones pasaron
-                        return el;
-                    };
-                    return findScrollable(panel);
-                }
-            """)
-            
-            # Convertir handle a ElementHandle
-            scroll_container = handle.as_element()
-            
-            if scroll_container:
-                # Loguear info del contenedor
-                try:
-                    tag = scroll_container.evaluate("el => el.tagName.toLowerCase()")
-                    role = scroll_container.evaluate("el => el.getAttribute('role') || ''")
-                    classes = scroll_container.evaluate("el => el.className || ''")
-                    overflow_y = scroll_container.evaluate("el => window.getComputedStyle(el).overflowY")
-                    # Resumir classes para no saturar logs
-                    class_summary = ' '.join(classes.split()[:3]) if classes else ''
-                    logger.info(
-                        "PlaywrightDM scroll_container_selected tag=%s role=%s overflowY=%s classes=%s",
-                        tag,
-                        role or 'none',
-                        overflow_y or 'none',
-                        class_summary or 'none'
-                    )
-                except Exception:
-                    pass
-                return scroll_container
-        except Exception:
-            pass
-        
-        return None
 
     def get_messages(self, thread: ThreadLike, amount: int = 20, *, log: bool = True) -> List[MessageLike]:
         page = self._ensure_page()
         self._open_thread(thread)
+
+        # Esperar a que los mensajes se hidraten
+        try:
+            msg_selector = _MESSAGE_NODE_SELECTORS[0]
+            page.wait_for_selector(f"main {msg_selector}, div[role='main'] {msg_selector}", timeout=3000)
+        except Exception:
+            pass
 
         nodes = self._collect_message_nodes(page)
         total = nodes.count()
@@ -680,16 +397,19 @@ class PlaywrightDMClient:
                     timestamp = time.time()
                     used_fallback_ts = True
                 outbound = self._is_outbound(node)
+                direction = "outbound" if outbound else "inbound"
                 user_id = self.user_id if outbound else _thread_peer_id(thread, self.user_id)
                 msg_id = _extract_message_id(node)
                 if not msg_id:
-                    msg_id = _hash_message_id(thread.id, user_id, text, timestamp)
+                    # Message ID estable recomendado
+                    msg_id = hashlib.sha1(f"{text}|{timestamp}|{direction}".encode()).hexdigest()[:12]
                 collected.append(
                     MessageLike(
                         id=msg_id,
                         user_id=user_id,
                         text=text,
                         timestamp=timestamp,
+                        direction=direction,
                     )
                 )
             except Exception:
@@ -727,25 +447,11 @@ class PlaywrightDMClient:
 
         try:
             composer.click()
-        except Exception:
-            pass
-        try:
-            composer.fill("")
-        except Exception:
-            pass
-        try:
             composer.fill(text)
-        except Exception:
-            try:
-                composer.type(text)
-            except Exception:
-                logger.warning("PlaywrightDM no pudo escribir mensaje thread=%s @%s", thread.id, self.username)
-                return None
-
-        try:
             composer.press("Enter")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("PlaywrightDM no pudo completar acciones de envío thread=%s @%s", thread.id, self.username)
+            return None
 
         message_id = self._verify_sent(thread, text)
         if message_id:
@@ -757,6 +463,8 @@ class PlaywrightDMClient:
     def _ensure_page(self) -> Page:
         if self._page is not None:
             return self._page
+
+        print(style_text(f"[PlaywrightDM] Iniciando navegador para @{self.username}...", color=Fore.WHITE))
 
         storage_state = self.storage_state_path(self.username)
         if not storage_state.exists():
@@ -797,14 +505,41 @@ class PlaywrightDMClient:
             pass
         self._dismiss_overlays(page)
         self._assert_logged_in(page)
-        for selector in ("a[href^='/direct/t/']", "nav[role='navigation']", "div[role='main']"):
+
+        found_container = None
+        # Lista ampliada de selectores de contenedor para mayor robustez
+        container_candidates = (
+            "div[role='main']",
+            "main",
+            "section",
+            "div[aria-label='Direct']",
+            "div[aria-label='Mensajes']",
+            "div[aria-label='Chats']",
+            "div[role='navigation']",
+            "a[href^='/direct/t/']"
+        )
+
+        for selector in container_candidates:
             try:
-                if page.locator(selector).count():
+                if page.locator(selector).count() > 0:
+                    found_container = selector
                     break
-                page.wait_for_selector(selector, timeout=8_000)
-                break
             except Exception:
                 continue
+
+        if not found_container:
+            # Si ninguno es visible de inmediato, esperar brevemente al más probable
+            try:
+                page.wait_for_selector("div[role='main'], main, div[role='navigation']", timeout=10_000)
+                # Re-chequear
+                for selector in container_candidates:
+                    if page.locator(selector).count() > 0:
+                        found_container = selector
+                        break
+            except Exception:
+                pass
+
+        print(style_text(f"[Probe] Inbox container: {found_container}", color=Fore.WHITE))
         for search_selector in ("input[placeholder='Buscar']", "input[placeholder='Search']", "input[name='queryBox']"):
             try:
                 page.wait_for_selector(search_selector, timeout=15_000)
@@ -843,6 +578,7 @@ class PlaywrightDMClient:
                     count = 0
                 logger.info("PlaywrightDM row_selector_count selector=%s count=%s", selector, count)
         logger.info("PlaywrightDM inbox_abierto account=@%s", self.username)
+        time.sleep(1)
 
     def _dismiss_overlays(self, page: Page) -> None:
         """
@@ -948,33 +684,54 @@ class PlaywrightDMClient:
             pass
 
     def _open_thread(self, thread: ThreadLike) -> None:
-        if self._current_thread_id == thread.id:
-            return
         page = self._ensure_page()
+
+        # PROBE: ¿Ya estamos en el thread correcto?
+        if "/direct/t/" in (page.url or "") and thread.id in page.url:
+            self._current_thread_id = thread.id
+            return
+
         opened = False
-        if thread.link:
-            url = _normalize_direct_link(thread.link)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                opened = True
-            except PlaywrightTimeoutError:
-                opened = False
-        if not opened and thread.id and not thread.id.startswith("stable_"):
+
+        # 1. Intentar navegación directa si tenemos ID real
+        if thread.id and not thread.id.startswith("stable_"):
             url = THREAD_URL_TEMPLATE.format(thread_id=thread.id)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                opened = True
-            except PlaywrightTimeoutError:
+                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                opened = self._wait_thread_open(page, timeout_ms=5000)
+            except Exception:
                 opened = False
+
+        # 2. Si es ID sintético o la navegación falló, usar el buscador de filas (sidebar)
+        if not opened:
+            opened = self._open_thread_by_cache(thread)
+
+        # 3. Fallback final: ir a inbox y reintentar sidebar
         if not opened:
             try:
-                page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=45_000)
+                page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=30_000)
+                opened = self._open_thread_by_cache(thread)
             except Exception:
-                pass
-            opened = self._open_thread_by_cache(thread)
-        if not opened:
-            raise RuntimeError("No se pudo abrir el thread por link o fila.")
+                opened = False
 
+        if not opened:
+            self.debug_dump_inbox("failed_to_open_thread")
+            raise RuntimeError(f"No se pudo abrir el thread '{thread.title}'")
+
+        # Capturar y actualizar ID real en el objeto thread
+        new_url = page.url or ""
+        real_id = _extract_thread_id(new_url)
+        if real_id and real_id != thread.id:
+            old_id = thread.id
+            logger.info("PlaywrightDM id_updated %s -> %s", old_id, real_id)
+            thread.id = real_id
+            thread.pk = real_id
+            # Actualizar cache interno
+            if old_id in self._thread_cache:
+                self._thread_cache[real_id] = self._thread_cache.pop(old_id)
+                self._thread_cache_meta[real_id] = self._thread_cache_meta.pop(old_id)
+
+        self._current_thread_id = thread.id
         self._assert_logged_in(page)
         try:
             page.wait_for_selector("textarea, div[role='textbox']", timeout=12_000)
@@ -1063,7 +820,9 @@ class PlaywrightDMClient:
         Probe de diagnóstico para saber exactamente donde estamos y qué vemos.
         """
         try:
-            page = self._ensure_page()
+            if self._page is None:
+                return
+            page = self._page
             url = page.url or ""
             in_inbox = "/direct/inbox/" in url
             in_thread = "/direct/t/" in url
@@ -1073,42 +832,59 @@ class PlaywrightDMClient:
                 try:
                     # check if it exists in DOM at all
                     count = page.locator(selector).count()
-                    visible = page.locator(selector).is_visible() if count > 0 else False
-                    composer_results[selector] = {"exists": count > 0, "visible": visible}
+                    visible = page.locator(selector).first.is_visible() if count > 0 else False
+                    composer_results[selector] = {"count": count, "visible": visible}
                 except Exception as e:
                     composer_results[selector] = {"error": str(e)}
 
+            message_results = {}
+            for selector in _MESSAGE_NODE_SELECTORS:
+                try:
+                    count = page.locator(selector).count()
+                    visible = page.locator(selector).first.is_visible() if count > 0 else False
+                    message_results[selector] = {"count": count, "visible": visible}
+                except Exception as e:
+                    message_results[selector] = {"error": str(e)}
+
             logger.info(
-                "PlaywrightDM diagnostic_probe label=%s url=%s in_inbox=%s in_thread=%s has_composer=%s details=%s",
-                label, url, in_inbox, in_thread, any(d.get("visible") for d in composer_results.values()), composer_results
+                "PlaywrightDM diagnostic_probe label=%s url=%s in_inbox=%s in_thread=%s has_composer=%s composer_details=%s message_details=%s",
+                label, url, in_inbox, in_thread,
+                any(d.get("visible") for d in composer_results.values() if isinstance(d, dict)),
+                composer_results, message_results
             )
         except Exception as e:
             logger.error("Error in PlaywrightDM diagnostic_probe: %s", e)
 
     def _wait_thread_open(self, page: Page, timeout_ms: int = 6000) -> bool:
         """
-        Espera a que el composer esté visible. Solo retorna True si aparece el composer.
-        NO acepta header u otros elementos como éxito.
+        Espera a que el composer esté visible y confirma que estamos en un thread.
         """
-        logger.info("PlaywrightDM wait_thread_open starting timeout=%dms", timeout_ms)
+        # 1. Esperar a que la URL cambie al patrón de thread
+        try:
+            page.wait_for_url(re.compile(r".*/direct/t/.*"), timeout=timeout_ms // 2)
+        except Exception:
+            pass
+
+        found_composer = False
         for selector in _COMPOSER_SELECTORS:
             try:
-                logger.info("PlaywrightDM wait_thread_open checking selector=%s", selector)
+                # Intentar esperar al selector
                 page.wait_for_selector(selector, timeout=timeout_ms // len(_COMPOSER_SELECTORS))
-                logger.info("PlaywrightDM wait_thread_open success selector=%s", selector)
-                return True
-            except Exception as e:
-                logger.info("PlaywrightDM wait_thread_open failed selector=%s reason=timeout_or_error", selector)
+                found_composer = True
+                break
+            except Exception:
                 continue
 
-        # Log state on failure
-        self._log_navigation_state("WAIT_THREAD_OPEN_FAILURE")
+        # Re-obtener URL después de la espera
+        current_url = page.url or ""
+        is_in_thread = bool(re.search(r"/direct/t/([^/]+)", current_url))
 
-        logger.warning(
-            "PlaywrightDM wait_thread_open_failed reason=no_composer url=%s",
-            (page.url or ""),
-        )
-        return False
+        # Probes de estado EXACTOS requeridos por el usuario
+        print(style_text(f"[Probe] URL = {current_url}", color=Fore.WHITE))
+        print(style_text(f"[Probe] thread_abierto = {is_in_thread and found_composer}", color=Fore.WHITE))
+        print(style_text(f"[Probe] existe_composer = {found_composer}", color=Fore.WHITE))
+
+        return is_in_thread and found_composer
 
     def _open_thread_by_cache(self, thread: ThreadLike) -> bool:
         """
@@ -1204,12 +980,6 @@ class PlaywrightDMClient:
                 first_line[:120]
             )
             
-            # Scroll e intentar click
-            try:
-                row.scroll_into_view_if_needed(timeout=2_000)
-            except Exception:
-                pass
-            
             try:
                 row.click()
             except Exception:
@@ -1249,140 +1019,6 @@ class PlaywrightDMClient:
         )
         return False
 
-    def _get_inbox_panel(self, page: Page):
-        search_selectors = (
-            "input[placeholder='Buscar']",
-            "input[placeholder='Search']",
-            "input[name='queryBox']",
-        )
-        search = None
-        used_selector = ""
-        for selector in search_selectors:
-            try:
-                candidate = page.locator(selector)
-                if candidate.count():
-                    search = candidate.first
-                    used_selector = selector
-                    break
-            except Exception:
-                continue
-        selector_candidates = self._row_selector_candidates()
-        if search is None:
-            row_selector_used = ""
-            rows = None
-            raw = 0
-            valid = 0
-            for selector in selector_candidates:
-                try:
-                    candidate = page.locator(selector)
-                    count = candidate.count()
-                except Exception:
-                    count = 0
-                    candidate = None
-                if count > 0 and candidate is not None:
-                    rows = candidate
-                    row_selector_used = selector
-                    raw = count
-                    break
-            if rows is not None:
-                valid = self._count_rows_valid(rows)
-            return page, "page", used_selector, {"raw": raw, "valid": valid, "level": 0, "row_selector": row_selector_used}
-
-        best_panel = None
-        best_method = "page"
-        best_level = 0
-        best_raw = 0
-        best_valid = -1
-        best_row_selector = ""
-        for level in range(1, 9):
-            try:
-                panel = search.locator(f"xpath=ancestor::*[self::div or self::section][{level}]")
-                if not panel.count():
-                    continue
-                panel = panel.first
-                rows = None
-                row_selector_used = ""
-                raw = 0
-                valid = 0
-                for selector in selector_candidates:
-                    try:
-                        candidate = panel.locator(selector)
-                        count = candidate.count()
-                    except Exception:
-                        count = 0
-                        candidate = None
-                    if count > 0 and candidate is not None:
-                        rows = candidate
-                        row_selector_used = selector
-                        raw = count
-                        break
-                if rows is not None:
-                    valid = self._count_rows_valid(rows)
-            except Exception:
-                continue
-            if valid > best_valid or (valid == best_valid and raw > best_raw):
-                best_panel = panel
-                best_method = f"ancestor[{level}]"
-                best_level = level
-                best_raw = raw
-                best_valid = valid
-                best_row_selector = row_selector_used
-        if best_panel is not None:
-            return (
-                best_panel,
-                best_method,
-                used_selector,
-                {"raw": best_raw, "valid": best_valid, "level": best_level, "row_selector": best_row_selector},
-            )
-
-        try:
-            panel = page.locator("div").filter(has=search).first
-            if panel.count():
-                rows = None
-                row_selector_used = ""
-                raw = 0
-                valid = 0
-                for selector in selector_candidates:
-                    try:
-                        candidate = panel.locator(selector)
-                        count = candidate.count()
-                    except Exception:
-                        count = 0
-                        candidate = None
-                    if count > 0 and candidate is not None:
-                        rows = candidate
-                        row_selector_used = selector
-                        raw = count
-                        break
-                if rows is not None:
-                    valid = self._count_rows_valid(rows)
-                return panel, "div_has_search", used_selector, {"raw": raw, "valid": valid, "level": 0, "row_selector": row_selector_used}
-        except Exception:
-            pass
-
-        try:
-            rows = None
-            row_selector_used = ""
-            raw = 0
-            valid = 0
-            for selector in selector_candidates:
-                try:
-                    candidate = page.locator(selector)
-                    count = candidate.count()
-                except Exception:
-                    count = 0
-                    candidate = None
-                if count > 0 and candidate is not None:
-                    rows = candidate
-                    row_selector_used = selector
-                    raw = count
-                    break
-            if rows is not None:
-                valid = self._count_rows_valid(rows)
-        except Exception:
-            raw = 0
-            valid = 0
-        return page, "page", used_selector, {"raw": raw, "valid": valid, "level": 0, "row_selector": row_selector_used}
 
     def _find_composer(self, page: Page):
         for selector in _COMPOSER_SELECTORS:
@@ -1589,14 +1225,27 @@ def _thread_unread_count(node) -> int:
         aria = (node.get_attribute("aria-label") or "").lower()
     except Exception:
         aria = ""
+
     if any(token in aria for token in _UNREAD_HINTS):
         return 1
+
+    # Búsqueda de badge por aria-label
     try:
         badge = node.locator("span[aria-label*='unread'], span[aria-label*='sin leer'], span[aria-label*='no leido']")
         if badge.count():
             return 1
     except Exception:
         pass
+
+    # Búsqueda por "punto azul" (visual) - Instagram suele usar un div/span con fondo azul
+    # El color rgb(0, 149, 246) es el azul característico de Instagram
+    try:
+        blue_dot = node.locator("div[style*='background-color: rgb(0, 149, 246)'], span[style*='background-color: rgb(0, 149, 246)']")
+        if blue_dot.count() > 0:
+            return 1
+    except Exception:
+        pass
+
     return 0
 
 

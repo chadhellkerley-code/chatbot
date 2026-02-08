@@ -293,6 +293,7 @@ def _save_conversation_engine() -> None:
         _CONVERSATION_ENGINE_FILE.write_text(
             json.dumps(_CONVERSATION_ENGINE_CACHE, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        print(style_text(f"[Persistencia] Archivo {_CONVERSATION_ENGINE_FILE} actualizado físicamente.", color=Fore.GREEN))
     except Exception as exc:
         logger.warning("Error guardando conversation_engine.json: %s", exc, exc_info=False)
 
@@ -371,7 +372,7 @@ def _load_all_conversations_to_memory(
     max_seconds = 20
     
     try:
-        print(style_text(f"[Memoria] Solicitando threads para @{account}...", color=Fore.CYAN))
+        print(style_text(f"[Memoria] Pre-discovery de threads para @{account}...", color=Fore.CYAN))
         threads = client.list_threads(amount=threads_limit, filter_unread=False)
     except Exception as exc:
         logger.warning("No se pudieron obtener threads para cargar memoria de @%s: %s", account, exc, exc_info=False)
@@ -1755,20 +1756,25 @@ def _latest_message(messages: List[object]) -> Optional[object]:
 
 def _fetch_inbox_threads(client, amount: int = 10) -> List[object]:
     collected: List[object] = []
+    print(style_text(f"[Discovery] Buscando threads (amount={amount})...", color=Fore.WHITE))
     try:
         threads = client.list_threads(amount=amount, filter_unread=True)
         if threads:
             collected.extend(threads)
+            print(style_text(f"[Discovery] Encontrados {len(threads)} unread threads", color=Fore.WHITE))
     except TypeError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(style_text(f"[Discovery] Error en list_threads(unread): {e}", color=Fore.RED))
+
     try:
         threads = client.list_threads(amount=amount, filter_unread=False)
         if threads:
             collected.extend(threads)
-    except Exception:
-        pass
+            print(style_text(f"[Discovery] Encontrados {len(threads)} threads totales", color=Fore.WHITE))
+    except Exception as e:
+        print(style_text(f"[Discovery] Error en list_threads(all): {e}", color=Fore.RED))
+
     if not collected:
         return []
     seen_ids: set[str] = set()
@@ -1942,11 +1948,14 @@ def _client_for(username: str):
     if not account:
         raise RuntimeError(f"No se encontro la cuenta {username}.")
     logger.info("autoresponder_dm_engine=playwright account=@%s", username)
-    client = PlaywrightDMClient(account=account, headless=True)
+    client = PlaywrightDMClient(account=account, headless=False, slow_mo_ms=1000)
     try:
         client.ensure_ready()
     except Exception:
         try:
+            if not client.headless:
+                print(style_text(f"[Debug] Navegador de @{username} queda abierto para inspección (fallo ensure_ready).", color=Fore.YELLOW))
+                time.sleep(120)
             client.close()
         except Exception:
             pass
@@ -4832,11 +4841,12 @@ def _process_inbox(
             "No threads visibles para @%s: ver screenshot/html en storage/logs (dm_debug_...)",
             user,
         )
+        # Extraer dump para saber por qué no hay threads
+        try:
+            client.debug_dump_inbox("no_threads_found")
+        except Exception:
+            pass
         return
-
-    total_threads = len(inbox)
-    logger.info("PlaywrightDM inbox_scan_result account=@%s total_found=%d ids=%s",
-                user, total_threads, [getattr(t, "id", None) for t in inbox])
     state.setdefault(user, {})
     max_age_seconds = max(0, int(max_age_days)) * 24 * 3600 if max_age_days is not None else 0
     now = time.time()
@@ -4846,16 +4856,41 @@ def _process_inbox(
     for idx, thread in enumerate(inbox, start=1):
         if STOP_EVENT.is_set():
             break
-        print(style_text(f"[Barrido] Thread {idx}/{total_threads} en progreso", color=Fore.CYAN))
-        thread_id_val = getattr(thread, "id", None) or getattr(thread, "pk", None)
-        if thread_id_val is None:
-            continue
-        thread_id = str(thread_id_val)
-        print(f"DEBUG: Processing thread {thread_id}")
-        if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
-            continue
+        print(style_text(f"Thread {idx}/{total_threads} | open_inbox OK", color=Fore.CYAN))
+
+        # 1. OBTENER MENSAJES
         messages = client.get_messages(thread, amount=10)
+
+        # 2. CAPTURAR CONTEXTO
+        thread_id = str(thread.id)
+        recipient_username = getattr(thread, "title", "unknown")
+        print(style_text(f"Thread {idx}/{total_threads} | open_thread recipient={recipient_username} thread_id={thread_id} OK", color=Fore.CYAN))
+
         if not messages:
+            print(style_text(f"Thread {idx}/{total_threads} | captured messages=0", color=Fore.YELLOW))
+            continue
+        print(style_text(f"Thread {idx}/{total_threads} | captured messages={len(messages)}", color=Fore.CYAN))
+
+        # 3. PERSISTENCIA INMEDIATA (Snapshot DOM)
+        msgs_snapshot = [
+            {
+                "message_id": m.id,
+                "direction": getattr(m, "direction", "inbound"),
+                "text": m.text,
+                "timestamp_epoch": m.timestamp
+            }
+            for m in messages
+        ]
+        _update_conversation_state(user, thread_id, {
+            "recipient_username": recipient_username,
+            "last_interaction_at": now,
+            "source": "playwright",
+            "captured_at_epoch": time.time(),
+            "messages": msgs_snapshot
+        })
+        print(style_text(f"Thread {idx}/{total_threads} | persisted memory OK", color=Fore.GREEN))
+
+        if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
         last = _latest_message(messages)
         if not last:
@@ -5009,7 +5044,9 @@ def _process_inbox(
                 reply,
                 force=_FORCE_ALWAYS_RESPOND,
             )
+            now_time_str = datetime.now().strftime("%H:%M")
             if not can_send:
+                print(style_text(f"Thread {idx}/{total_threads} | bot_action=ignore at {now_time_str}", color=Fore.YELLOW))
                 logger.info(
                     "Omitiendo envío para @%s → @%s: %s",
                     user,
@@ -5019,8 +5056,10 @@ def _process_inbox(
                 if last_id:
                     state[user][thread_id] = last_id
                 save_auto_state(state)
+                print(style_text(f"Thread {idx}/{total_threads} | done", color=Fore.CYAN))
                 continue
 
+            print(style_text(f"Thread {idx}/{total_threads} | bot_action=respond at {now_time_str}", color=Fore.GREEN))
             logger.info(
                 "Decision responder @%s thread=%s stage=%s reason=%s",
                 user,
@@ -5070,6 +5109,7 @@ def _process_inbox(
         index = stats.record_success(user)
         logger.info("Respuesta enviada por @%s en hilo %s (etapa: %s)", user, thread_id, stage)
         _print_response_summary(index, user, recipient_username, True, calendar_status_line)
+        print(style_text(f"Thread {idx}/{total_threads} | done", color=Fore.CYAN))
     print(style_text(f"[Barrido] Scan completo para @{user}", color=Fore.GREEN))
 
 def _print_bot_summary(stats: BotStats) -> None:
@@ -5232,6 +5272,9 @@ def _activate_bot() -> None:
                     finally:
                         if client is not None:
                             try:
+                                if not client.headless:
+                                    print(style_text(f"[Debug] Navegador de @{user} queda abierto 120s para inspección manual.", color=Fore.YELLOW))
+                                    time.sleep(120)
                                 client.close()
                             except Exception:
                                 pass
