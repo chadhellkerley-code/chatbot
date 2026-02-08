@@ -500,6 +500,8 @@ class HumanInstagramSender:
         toast_negative = re.compile(r"(not sent|no se pudo enviar|no enviado)", re.IGNORECASE)
 
         message_selectors = [
+            "[data-testid='own']",
+            "[data-testid='message-bubble-outgoing']",
             "div[role='list'] div[role='listitem']",
             "div[role='list'] div[role='row']",
             "div[role='log'] div[role='listitem']",
@@ -532,8 +534,12 @@ class HumanInstagramSender:
                     toast = page.locator(selector).last
                     if await toast.count() > 0:
                         toast_text = (await toast.inner_text() or "").strip()
-                        if toast_text and toast_success.search(toast_text) and not toast_negative.search(toast_text):
-                            return True, "toast_sent"
+                        if toast_text:
+                            if toast_negative.search(toast_text):
+                                logger.warning("Detalle: Error detectado en toast: %s", toast_text)
+                                return False, f"error_toast: {toast_text}"
+                            if toast_success.search(toast_text):
+                                return True, "toast_sent"
                 except Exception:
                     continue
             if composer is not None:
@@ -550,18 +556,48 @@ class HumanInstagramSender:
                     items = page.locator(sel)
                     count = await items.count()
                     if count > 0:
-                        start = max(0, count - 3)
+                        # Revisamos los últimos 5 mensajes para mayor seguridad
+                        start = max(0, count - 5)
                         for idx in range(start, count):
                             item = items.nth(idx)
                             try:
                                 text_value = await item.inner_text()
                             except Exception:
                                 text_value = await item.text_content() or ""
+
                             if _contains_snippet(text_value) or _contains_prefix(text_value):
-                                return True, "message_present"
+                                # Verificación determinística de que es OUTGOING
+                                is_own = False
+                                try:
+                                    if await item.get_attribute("data-testid") == "own":
+                                        is_own = True
+                                    elif await item.locator("[data-testid='own']").count() > 0:
+                                        is_own = True
+                                    else:
+                                        # Heurística de posición (derecha del thread)
+                                        box = await item.bounding_box()
+                                        if box:
+                                            viewport = page.viewport_size
+                                            if viewport and (box['x'] + box['width']/2) > (viewport['width'] / 2):
+                                                is_own = True
+                                except Exception:
+                                    pass
+
+                                if is_own:
+                                    return True, "message_present_outgoing"
+                                else:
+                                    # Si encontramos el texto pero es del otro lado, seguimos buscando
+                                    continue
+
                         matches = items.filter(has_text=snippet)
                         if await matches.count() > 0:
-                            return True, "message_present"
+                            # Si el filter encuentra algo, intentamos validar el último match
+                            last_match = matches.last
+                            box = await last_match.bounding_box()
+                            if box:
+                                viewport = page.viewport_size
+                                if viewport and (box['x'] + box['width']/2) > (viewport['width'] / 2):
+                                    return True, "message_present_outgoing_heuristic"
                 except Exception:
                     continue
 
@@ -760,18 +796,16 @@ class HumanInstagramSender:
                     reason = reason_retry
                     payload["verified"] = True
             if not ok:
-                if reason in {"message_not_present_after_send", "composer_not_cleared"}:
-                    current_url = page.url if page else ""
-                    detail = "sent_request" if "/direct/requests" in (current_url or "") else "sent_unverified"
-                    payload["verification_reason"] = reason
-                    payload["detail"] = detail
-                    if detail == "sent_unverified":
-                        payload["sent_unverified"] = True
-                        payload["reason_code"] = "SENT_UNVERIFIED"
-                    if return_payload:
-                        return True, detail, payload
-                    return (True, detail) if return_detail else True
-                raise RuntimeError(reason)
+                # Si llegamos aquí sin 'ok', es que falló la verificación determinística.
+                # Para cumplir con el requerimiento de 'no suposiciones', devolvemos False.
+                payload["verified"] = False
+                payload["verification_reason"] = reason
+                detail = reason or "verification_failed"
+                payload["detail"] = detail
+                logger.warning("Envío no verificado: %s", reason)
+                if return_payload:
+                    return False, detail, payload
+                return (False, detail) if return_detail else False
 
             storage_path = Path(BASE_PROFILES) / username / "storage_state.json"
             try:

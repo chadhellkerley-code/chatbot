@@ -1704,18 +1704,6 @@ def menu_send_rotating(
                     reason_label = NO_DM_SKIP_DETAIL
                     scope = "lead"
                     break
-                if (
-                    payload.get("sent_unverified")
-                    or (payload.get("reason_code") or "").strip().upper() == SENT_UNVERIFIED_REASON
-                    or (info or "").strip().lower() == "sent_unverified"
-                ):
-                    success_flag = True
-                    verified_flag = False
-                    detail = info or "sent_unverified"
-                    reason_code = SENT_UNVERIFIED_REASON
-                    reason_label = "Enviado sin verificación"
-                    scope = "lead"
-                    break
                 if success_flag:
                     verified_flag = bool(payload.get("verified", True))
                 if success_flag:
