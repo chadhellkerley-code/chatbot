@@ -1027,13 +1027,23 @@ def _handle_event(
     username = event.username
     skip_reason = (event.reason_code or "").strip().upper()
 
-    # Manejo de skips (No DM o No match exacto)
-    if not event.success and skip_reason in (NO_DM_SKIP_REASON, EXACT_USER_SKIP_REASON):
-        account_error_streaks.pop(username, None)
+    # Manejo de skips (No DM, No match exacto o error de destinatario)
+    is_recipient_error = (not event.success and event.scope == "recipient")
+    if (not event.success and skip_reason in (NO_DM_SKIP_REASON, EXACT_USER_SKIP_REASON)) or is_recipient_error:
+        # Requisito Fase 4: Los skips NO resetean ni incrementan el contador de errores de cuenta.
+        # Por lo tanto, no llamamos a pop() ni incrementamos el streak aquí.
 
         is_exact_skip = (skip_reason == EXACT_USER_SKIP_REASON)
-        detail = event.detail or (EXACT_USER_SKIP_DETAIL if is_exact_skip else NO_DM_SKIP_DETAIL)
-        log_msg = EXACT_USER_SKIP_LOG if is_exact_skip else NO_DM_SKIP_LOG
+        detail = event.detail
+        if not detail:
+            if is_exact_skip: detail = EXACT_USER_SKIP_DETAIL
+            elif is_recipient_error: detail = "Error de destinatario (privacidad o no existe)"
+            else: detail = NO_DM_SKIP_DETAIL
+
+        log_msg = detail
+        if is_exact_skip: log_msg = EXACT_USER_SKIP_LOG
+        elif is_recipient_error: log_msg = f"skip | recipient | {detail}"
+        else: log_msg = NO_DM_SKIP_LOG
 
         if no_dm_by_account is not None:
             no_dm_by_account[username] = int(no_dm_by_account.get(username, 0)) + 1
@@ -1059,10 +1069,10 @@ def _handle_event(
             cancelled=event.cancelled,
             verified=False,
             skip=True,
-            skip_reason=skip_reason,
+            skip_reason=skip_reason or ("recipient_error" if is_recipient_error else "unknown_skip"),
         )
         bump("skipped_no_dm", 1)
-        action_label = "exact_match_skip" if is_exact_skip else "no_dm"
+        action_label = "exact_match_skip" if is_exact_skip else ("recipient_skip" if is_recipient_error else "no_dm")
         emit_log(username, event.lead, "skip", f"{action_label} | {detail}", None)
         return None
     if event.success:
@@ -1163,12 +1173,12 @@ def _handle_event(
                 status="paused",
                 reason="overnight_retries_exhausted",
             )
-        if streak >= 2 and normalized_username not in paused_accounts:
+        if streak >= 3 and normalized_username not in paused_accounts:
             emit_log(
                 username,
                 event.lead,
                 "warning",
-                "Proteccion activada (2 errores consecutivos).",
+                "Proteccion activada (3 errores consecutivos).",
                 None,
             )
             if overnight:
