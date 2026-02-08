@@ -696,23 +696,85 @@ class HumanInstagramSender:
 
             clicked = False
             click_error: Exception | None = None
+
+            # 1. Buscar botón visible en el perfil
             dm_button = await find_profile_dm_button(page)
             if dm_button is not None:
                 try:
-                    logger.info("Clickeando boton de mensaje en perfil.")
-                    await dm_button.click()
-                    clicked = True
+                    if await dm_button.is_visible():
+                        logger.info("Clickeando botón de mensaje visible en perfil.")
+                        await dm_button.click()
+                        clicked = True
                 except Exception as exc:
+                    logger.debug("Fallo click en botón visible: %s", exc)
                     click_error = exc
 
+            # 2. Si no se encontró o no se pudo clickear, buscar en menú de tres puntos (⋯)
+            if not clicked:
+                logger.info("Botón directo no encontrado o falló. Probando menú de tres puntos (⋯).")
+                three_dots_selectors = [
+                    "svg[aria-label='More options']",
+                    "svg[aria-label='Más opciones']",
+                    "svg[aria-label='Options']",
+                    "svg[aria-label='Opciones']",
+                    "div[role='button']:has(svg[aria-label*='opcion'])",
+                    "div[role='button']:has(svg[aria-label*='option'])",
+                ]
+
+                three_dots = None
+                for sel in three_dots_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            three_dots = loc
+                            break
+                    except Exception:
+                        continue
+
+                if three_dots:
+                    try:
+                        await three_dots.click()
+                        await self._sleep(1, 2)
+
+                        # Buscar opción de "Enviar mensaje" en el diálogo abierto
+                        menu_options = [
+                            "span:has-text('Send message')",
+                            "span:has-text('Enviar mensaje')",
+                            "button:has-text('Send message')",
+                            "button:has-text('Enviar mensaje')",
+                            "div[role='button']:has-text('Send message')",
+                            "div[role='button']:has-text('Enviar mensaje')",
+                        ]
+
+                        option_found = False
+                        for opt_sel in menu_options:
+                            try:
+                                opt = page.locator(opt_sel).first
+                                if await opt.count() > 0 and await opt.is_visible():
+                                    logger.info("Opción 'Enviar mensaje' encontrada en menú de tres puntos.")
+                                    await opt.click()
+                                    option_found = True
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+
+                        if not option_found:
+                            # Cerrar el menú si no se encontró la opción (usualmente con Escape)
+                            await page.keyboard.press("Escape")
+                    except Exception as e:
+                        logger.debug("Error interactuando con menú de tres puntos: %s", e)
+
+            # 3. Verificación final de disponibilidad
             if not clicked:
                 availability = await detect_dm_availability(page)
                 if availability == DmAvailability.NO_DM:
                     logger.info(NO_DM_SKIP_LOG)
                     return NO_DM_SEND_METHOD
+
                 if click_error is not None:
-                    logger.debug("Error clickeando boton de mensaje: %s", click_error)
-                raise RuntimeError("No se encontro boton 'Enviar mensaje' en el perfil del usuario.")
+                    logger.debug("Error acumulado clickeando botón de mensaje: %s", click_error)
+                raise RuntimeError("No se encontró botón 'Enviar mensaje' ni en el perfil ni en el menú opcional.")
 
             try:
                 await page.wait_for_selector(", ".join(COMPOSERS), timeout=25_000)
