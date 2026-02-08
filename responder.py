@@ -1777,7 +1777,12 @@ def _fetch_inbox_threads(client, amount: int = 10) -> List[object]:
     for thread in collected:
         thread_id_val = getattr(thread, "id", None) or getattr(thread, "pk", None)
         if thread_id_val is None:
-            continue
+            # Fallback a ID sintético para threads sin ID (ej: no cargados completamente)
+            title = getattr(thread, "title", "unknown")
+            synth_id = hashlib.sha1(f"synth|{title}".encode()).hexdigest()[:16]
+            thread_id_val = f"stable_{synth_id}"
+            setattr(thread, "id", thread_id_val)
+
         thread_id = str(thread_id_val)
         if thread_id in seen_ids:
             continue
@@ -4852,11 +4857,16 @@ def _process_inbox(
         if thread_id_val is None:
             continue
         thread_id = str(thread_id_val)
+        print(style_text(f"[Barrido] Procesando Thread ID: {thread_id}", color=Fore.CYAN))
         logger.debug("PlaywrightDM processing thread %s", thread_id)
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
         messages = client.get_messages(thread, amount=10)
         if not messages:
+            print(style_text(f"[PlaywrightDM] Thread {thread_id} sin mensajes (omitido)", color=Fore.YELLOW))
+            # PROBE: ¿Estamos dentro del thread aunque no haya mensajes?
+            # Intentamos persistir al menos el ID para seguimiento de diagnóstico
+            _update_conversation_state(user, thread_id, {"updated_at": time.time()})
             continue
         last = _latest_message(messages)
         if not last:
@@ -4940,7 +4950,7 @@ def _process_inbox(
             last_seen_id,
         )
         # DIAGNOSTICO: Confirmar paso a persistencia
-        print(style_text(f"[Persistencia] Registrando mensaje recibido para @{recipient_username} (Thread: {thread_id})", color=Fore.WHITE))
+        print(style_text(f"[Persistencia] PERSISTIENDO mensaje recibido para @{recipient_username} (Thread: {thread_id})", color=Fore.GREEN, bold=True))
         logger.info("PlaywrightDM passing to _record_message_received: thread_id=%s recipient=%s", thread_id, recipient_username)
         _record_message_received(user, thread_id, last_id_str, recipient_username)
         

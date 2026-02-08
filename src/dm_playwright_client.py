@@ -46,6 +46,8 @@ _MESSAGE_CONTAINER_SELECTORS = (
 _MESSAGE_NODE_SELECTORS = (
     "[data-testid='message-bubble']",
     "div[role='row']",
+    "div[role='none']",
+    "div[dir='auto']",
 )
 _COMPOSER_SELECTORS = (
     "div[role='main'] div[role='textbox'][contenteditable='true']",
@@ -349,10 +351,29 @@ class PlaywrightDMClient:
 
                 # PROBE: Estado del thread
                 is_url_thread = "/direct/t/" in (page.url or "")
-                messages_visible = self._collect_message_nodes(page).count() > 0
+
+                # Intentar esperar un momento si la URL indica thread pero no hay mensajes
+                if is_url_thread and self._collect_message_nodes(page).count() == 0:
+                    page.wait_for_timeout(1500)
+
+                msg_nodes = self._collect_message_nodes(page)
+                messages_visible = msg_nodes.count() > 0
+
                 print(style_text(f"[PlaywrightDM] PROBE: thread abierto = {opened or is_url_thread}", color=Fore.CYAN))
                 print(style_text(f"[PlaywrightDM] PROBE: composer visible = {composer is not None}", color=Fore.CYAN))
                 print(style_text(f"[PlaywrightDM] PROBE: hay mensajes visibles = {messages_visible}", color=Fore.CYAN))
+                if not messages_visible and is_url_thread:
+                    # Diagnóstico profundo si estamos en URL de thread pero no vemos mensajes
+                    try:
+                        main_content = page.locator("main, div[role='main']").first
+                        if main_content.count():
+                            roles = main_content.evaluate("el => Array.from(el.querySelectorAll('*')).map(e => e.getAttribute('role')).filter(Boolean)")
+                            testids = main_content.evaluate("el => Array.from(el.querySelectorAll('*')).map(e => e.getAttribute('data-testid')).filter(Boolean)")
+                            print(style_text(f"[PlaywrightDM] DIAGNOSTICO: roles encontrados en main: {list(set(roles))[:10]}", color=Fore.YELLOW))
+                            print(style_text(f"[PlaywrightDM] DIAGNOSTICO: testids encontrados en main: {list(set(testids))[:10]}", color=Fore.YELLOW))
+                    except Exception:
+                        pass
+
                 print(f"[PlaywrightDM] URL de thread: {is_url_thread}")
 
                 # REQUISITO: Si el thread está abierto (por URL o indicadores), permitir captura
@@ -682,6 +703,14 @@ class PlaywrightDMClient:
     def get_messages(self, thread: ThreadLike, amount: int = 20, *, log: bool = True) -> List[MessageLike]:
         page = self._ensure_page()
         self._open_thread(thread)
+
+        # Esperar a que los mensajes se hidraten
+        try:
+            # Esperar a que aparezca al menos un nodo de mensaje
+            msg_selector = _MESSAGE_NODE_SELECTORS[0]
+            page.wait_for_selector(f"main {msg_selector}, div[role='main'] {msg_selector}", timeout=2000)
+        except Exception:
+            pass
 
         nodes = self._collect_message_nodes(page)
         total = nodes.count()
