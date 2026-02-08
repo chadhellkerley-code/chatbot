@@ -1010,14 +1010,14 @@ class PlaywrightDMClient:
 
     def _open_thread(self, thread: ThreadLike) -> None:
         if self._current_thread_id == thread.id:
-            print(style_text(f"[PlaywrightDM] _open_thread: Thread {thread.id} ya esta abierto (current_thread_id match)", color=Fore.CYAN))
             # Verificación extra: ¿seguimos en la URL correcta?
             if "/direct/t/" in (self._page.url or "") and thread.id in self._page.url:
+                print(style_text(f"[PlaywrightDM] OK: Saltando navegación, ya estamos en el thread {thread.id}", color=Fore.CYAN))
                 return
             else:
-                print(style_text(f"[PlaywrightDM] _open_thread: URL no coincide, forzando re-apertura", color=Fore.YELLOW))
+                print(style_text(f"[PlaywrightDM] _open_thread: URL ({self._page.url}) no coincide con ID {thread.id}, forzando re-apertura", color=Fore.YELLOW))
 
-        print(style_text(f"[PlaywrightDM] _open_thread: Abriendo thread {thread.id}", color=Fore.WHITE))
+        print(style_text(f"[PlaywrightDM] _open_thread: Navegando al thread {thread.id}...", color=Fore.WHITE))
         page = self._ensure_page()
         opened = False
         if thread.link:

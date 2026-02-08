@@ -387,7 +387,8 @@ def _load_all_conversations_to_memory(
     max_age_seconds = max(0, int(max_age_days)) * 24 * 3600 if max_age_days is not None else 0
     print(style_text(f"[Memoria] Cargando conversaciones para @{account}...", color=Fore.CYAN))
     start_ts = time.time()
-    max_seconds = 20
+    # Para Playwright el escaneo es secuencial y por click, aumentamos el tiempo maximo.
+    max_seconds = 180
     
     try:
         print(style_text(f"[Memoria] Solicitando threads para @{account}...", color=Fore.CYAN))
@@ -1777,6 +1778,7 @@ def _latest_message(messages: List[object]) -> Optional[object]:
 def _fetch_inbox_threads(client, amount: int = 10) -> List[object]:
     collected: List[object] = []
     try:
+        print(style_text(f"[Barrido] Buscando chats no leídos (limite: {amount})...", color=Fore.WHITE))
         threads = client.list_threads(amount=amount, filter_unread=True)
         if threads:
             collected.extend(threads)
@@ -1784,12 +1786,19 @@ def _fetch_inbox_threads(client, amount: int = 10) -> List[object]:
         pass
     except Exception:
         pass
-    try:
-        threads = client.list_threads(amount=amount, filter_unread=False)
-        if threads:
-            collected.extend(threads)
-    except Exception:
-        pass
+
+    if len(collected) < amount:
+        try:
+            print(style_text(f"[Barrido] Buscando todos los chats (faltan {amount - len(collected)})...", color=Fore.WHITE))
+            threads = client.list_threads(amount=amount, filter_unread=False)
+            if threads:
+                for t in threads:
+                    if not any(getattr(t, 'id', '1') == getattr(c, 'id', '2') for c in collected):
+                        collected.append(t)
+                        if len(collected) >= amount:
+                            break
+        except Exception:
+            pass
     if not collected:
         return []
     seen_ids: set[str] = set()
@@ -4849,7 +4858,8 @@ def _process_inbox(
     threads_limit: int = 20,
 ) -> None:
     print(style_text(f"[Barrido] Iniciando scan de @{user}", color=Fore.CYAN))
-    _load_all_conversations_to_memory(client, user, max_age_days, threads_limit=threads_limit)
+    # Para Playwright omitimos el pre-cargado redundante de toda la memoria por click.
+    # _load_all_conversations_to_memory(client, user, max_age_days, threads_limit=threads_limit)
     
     inbox = _fetch_inbox_threads(client, amount=threads_limit)
     if not inbox:
