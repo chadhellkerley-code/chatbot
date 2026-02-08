@@ -778,40 +778,35 @@ class PlaywrightDMClient:
         return collected
 
     def send_message(self, thread: ThreadLike, text: str) -> Optional[str]:
+        print(style_text(f"[PlaywrightDM] Intentando enviar mensaje a thread {thread.id}", color=Fore.WHITE))
         page = self._ensure_page()
         self._open_thread(thread)
 
         composer = self._find_composer(page)
         if composer is None:
+            print(style_text(f"[PlaywrightDM] Abortando envío: no se encontró el composer.", color=Fore.RED, bold=True))
             logger.warning("PlaywrightDM sin composer thread=%s @%s", thread.id, self.username)
             return None
 
         try:
+            print(style_text(f"[PlaywrightDM] Haciendo click en composer...", color=Fore.WHITE))
             composer.click()
-        except Exception:
-            pass
-        try:
-            composer.fill("")
-        except Exception:
-            pass
-        try:
+            print(style_text(f"[PlaywrightDM] Escribiendo mensaje...", color=Fore.WHITE))
             composer.fill(text)
-        except Exception:
-            try:
-                composer.type(text)
-            except Exception:
-                logger.warning("PlaywrightDM no pudo escribir mensaje thread=%s @%s", thread.id, self.username)
-                return None
-
-        try:
+            print(style_text(f"[PlaywrightDM] Presionando Enter...", color=Fore.WHITE))
             composer.press("Enter")
-        except Exception:
-            pass
+        except Exception as e:
+            print(style_text(f"[PlaywrightDM] ERROR durante la escritura/envío: {e}", color=Fore.RED))
+            logger.warning("PlaywrightDM no pudo completar acciones de envío thread=%s @%s", thread.id, self.username)
+            return None
 
+        print(style_text(f"[PlaywrightDM] Verificando envío...", color=Fore.WHITE))
         message_id = self._verify_sent(thread, text)
         if message_id:
+            print(style_text(f"[PlaywrightDM] Envío CONFIRMADO. ID: {message_id}", color=Fore.GREEN, bold=True))
             logger.info("PlaywrightDM envio_ok thread=%s msg_id=%s", thread.id, message_id)
         else:
+            print(style_text(f"[PlaywrightDM] Envío NO VERIFICADO en el DOM.", color=Fore.YELLOW))
             logger.warning("PlaywrightDM envio_no_verificado thread=%s @%s", thread.id, self.username)
         return message_id
 
@@ -1176,25 +1171,38 @@ class PlaywrightDMClient:
         Espera a que el composer esté visible. Solo retorna True si aparece el composer.
         NO acepta header u otros elementos como éxito.
         """
-        logger.info("PlaywrightDM wait_thread_open starting timeout=%dms", timeout_ms)
-        print(style_text(f"[PlaywrightDM] Esperando composer visible (timeout {timeout_ms}ms)...", color=Fore.WHITE))
+        url = page.url or ""
+        logger.info("PlaywrightDM wait_thread_open starting timeout=%dms url=%s", timeout_ms, url)
+        print(style_text(f"[PlaywrightDM] Esperando composer visible en {url} (timeout {timeout_ms}ms)...", color=Fore.WHITE))
+
+        # PROBE: ¿La URL indica que estamos en un thread?
+        is_url_thread = "/direct/t/" in url
+        if is_url_thread:
+            print(style_text(f"[PlaywrightDM] URL coincide con thread, procediendo a buscar componentes...", color=Fore.CYAN))
+        else:
+            print(style_text(f"[PlaywrightDM] ADVERTENCIA: La URL actual no parece ser un thread: {url}", color=Fore.YELLOW))
+
         for selector in _COMPOSER_SELECTORS:
             try:
                 logger.info("PlaywrightDM wait_thread_open checking selector=%s", selector)
                 page.wait_for_selector(selector, timeout=timeout_ms // len(_COMPOSER_SELECTORS))
                 logger.info("PlaywrightDM wait_thread_open success selector=%s", selector)
-                print(style_text(f"[PlaywrightDM] Composer detectado con: {selector}", color=Fore.GREEN))
+                print(style_text(f"[PlaywrightDM] OK: Composer detectado con: {selector}", color=Fore.GREEN))
                 return True
-            except Exception as e:
-                logger.info("PlaywrightDM wait_thread_open failed selector=%s reason=timeout_or_error", selector)
+            except Exception:
+                print(style_text(f"[PlaywrightDM] Composer NO detectado con: {selector}", color=Fore.YELLOW))
                 continue
 
         # Log state on failure
         self._log_navigation_state("WAIT_THREAD_OPEN_FAILURE")
 
+        # PROBE: Si la URL es de thread pero no hay composer, es un fallo crítico de UI
+        if is_url_thread:
+            print(style_text(f"[PlaywrightDM] ERROR: URL de thread detectada pero NINGÚN selector de composer funcionó.", color=Fore.RED, bold=True))
+
         logger.warning(
             "PlaywrightDM wait_thread_open_failed reason=no_composer url=%s",
-            (page.url or ""),
+            url,
         )
         return False
 
@@ -1473,13 +1481,16 @@ class PlaywrightDMClient:
         return page, "page", used_selector, {"raw": raw, "valid": valid, "level": 0, "row_selector": row_selector_used}
 
     def _find_composer(self, page: Page):
+        print(style_text(f"[PlaywrightDM] Buscando composer...", color=Fore.WHITE))
         for selector in _COMPOSER_SELECTORS:
             try:
                 loc = page.locator(selector)
                 if loc.count():
+                    print(style_text(f"[PlaywrightDM] Composer encontrado: {selector}", color=Fore.GREEN))
                     return loc.first
             except Exception:
                 continue
+        print(style_text(f"[PlaywrightDM] Composer NO encontrado en el DOM.", color=Fore.RED))
         return None
 
     def _refresh_thread_participants(self, page: Page, thread: ThreadLike) -> None:

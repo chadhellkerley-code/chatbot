@@ -292,13 +292,26 @@ def _save_conversation_engine() -> None:
     try:
         count = len(_CONVERSATION_ENGINE_CACHE.get("conversations", {}))
         print(style_text(f"[Persistencia] Guardando {count} conversaciones en conversation_engine.json...", color=Fore.WHITE))
+
+        # PROBE: Capturar tiempo antes de escribir
+        before_ts = time.time()
+
         _CONVERSATION_ENGINE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _CONVERSATION_ENGINE_FILE.write_text(
             json.dumps(_CONVERSATION_ENGINE_CACHE, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+        # PROBE: Verificar escritura física
+        if _CONVERSATION_ENGINE_FILE.exists():
+            mtime = _CONVERSATION_ENGINE_FILE.stat().st_mtime
+            if mtime >= before_ts - 1: # Un pequeño margen por precisión del FS
+                print(style_text(f"[Persistencia] CONFIRMACIÓN: Archivo escrito correctamente (mtime: {mtime})", color=Fore.GREEN))
+            else:
+                print(style_text(f"[Persistencia] ADVERTENCIA: El archivo existe pero el mtime no se actualizó.", color=Fore.YELLOW))
+
         print(style_text(f"[Persistencia] Guardado OK. Ruta: {_CONVERSATION_ENGINE_FILE}", color=Fore.GREEN))
     except Exception as exc:
-        print(style_text(f"[Persistencia] ERROR guardando: {exc}", color=Fore.RED))
+        print(style_text(f"[Persistencia] ERROR CRÍTICO al guardar: {exc}", color=Fore.RED, bold=True))
         logger.warning("Error guardando conversation_engine.json: %s", exc, exc_info=False)
 
 
@@ -4859,6 +4872,7 @@ def _process_inbox(
     for idx, thread in enumerate(inbox, start=1):
         if STOP_EVENT.is_set():
             break
+        print(style_text(f"[PROBE] Transición a memoria iniciada para thread {idx}/{total_threads}", color=Fore.CYAN, bold=True))
         print(style_text(f"[Barrido] Thread {idx}/{total_threads} en progreso", color=Fore.CYAN))
         thread_id_val = getattr(thread, "id", None) or getattr(thread, "pk", None)
         if thread_id_val is None:
