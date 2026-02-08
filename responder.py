@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-  NUEVA VERSION MATI, SI FUNCIONA ESTO!
 import base64
+import hashlib
 import importlib
 import getpass
 import json
@@ -4836,7 +4837,7 @@ def _process_inbox(
 
     total_threads = len(inbox)
     logger.info("PlaywrightDM inbox_scan_result account=@%s total_found=%d ids=%s",
-                user, total_threads, [getattr(t, "id", None) for t in inbox])
+                user, total_threads, [getattr(t, "id", "synthetic_" + hashlib.sha1((user + getattr(t, "title", "")).encode()).hexdigest()[:8]) for t in inbox])
     state.setdefault(user, {})
     max_age_seconds = max(0, int(max_age_days)) * 24 * 3600 if max_age_days is not None else 0
     now = time.time()
@@ -4851,7 +4852,7 @@ def _process_inbox(
         if thread_id_val is None:
             continue
         thread_id = str(thread_id_val)
-        print(f"DEBUG: Processing thread {thread_id}")
+        logger.debug("PlaywrightDM processing thread %s", thread_id)
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
         messages = client.get_messages(thread, amount=10)
@@ -4938,6 +4939,9 @@ def _process_inbox(
             last_id_str,
             last_seen_id,
         )
+        # DIAGNOSTICO: Confirmar paso a persistencia
+        print(style_text(f"[Persistencia] Registrando mensaje recibido para @{recipient_username} (Thread: {thread_id})", color=Fore.WHITE))
+        logger.info("PlaywrightDM passing to _record_message_received: thread_id=%s recipient=%s", thread_id, recipient_username)
         _record_message_received(user, thread_id, last_id_str, recipient_username)
         
         convo = "\n".join(
@@ -4960,6 +4964,9 @@ def _process_inbox(
             time_since_last_received=time_since_last_received,
         )
         
+        # DIAGNOSTICO: Confirmar paso a _update_conversation_state
+        print(style_text(f"[Persistencia] Actualizando estado a '{stage}' para @{recipient_username}", color=Fore.WHITE))
+        logger.info("PlaywrightDM passing to _update_conversation_state: thread_id=%s stage=%s", thread_id, stage)
         _update_conversation_state(user, thread_id, {"stage": stage}, recipient_username)
         
         status = _classify_response(last.text or "")

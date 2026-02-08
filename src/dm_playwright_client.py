@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+from ui import Fore, style_text
+
 try:  # pragma: no cover - optional dependency guard
     from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 except Exception:  # pragma: no cover
@@ -49,6 +51,8 @@ _COMPOSER_SELECTORS = (
     "div[role='main'] div[role='textbox'][contenteditable='true']",
     "div[role='main'] div[contenteditable='true'][role='textbox']",
     "div[role='main'] textarea",
+    "div[role='textbox'][contenteditable='true']",
+    "div[contenteditable='true']",
 )
 
 _UNREAD_HINTS = ("unread", "sin leer", "no leido", "no leido")
@@ -162,6 +166,7 @@ class PlaywrightDMClient:
         self._open_inbox()
 
     def list_threads(self, amount: int = 20, filter_unread: bool = False) -> List[ThreadLike]:
+        print(style_text(f"[PlaywrightDM] list_threads account=@{self.username} amount={amount} unread={filter_unread}", color=Fore.CYAN))
         page = self._ensure_page()
         self._open_inbox()
         try:
@@ -281,8 +286,10 @@ class PlaywrightDMClient:
             except Exception:
                 total = 0
             if total <= 0:
+                print(style_text(f"[PlaywrightDM] No se encontraron filas con el selector {row_selector_used}", color=Fore.YELLOW))
                 break
 
+            print(style_text(f"[PlaywrightDM] Escaneando {total} filas (scroll {scrolls})", color=Fore.CYAN))
             idx = 0
             while idx < total and len(threads) < amount:
                 row_idx = idx
@@ -321,8 +328,10 @@ class PlaywrightDMClient:
                 except Exception:
                     pass
                 try:
+                    print(style_text(f"[PlaywrightDM] Click en fila {row_idx+1}/{total}: {first_line[:50]}...", color=Fore.WHITE))
                     row.click()
-                except Exception:
+                except Exception as e:
+                    print(style_text(f"[PlaywrightDM] Click fallido en fila {row_idx+1}: {e}", color=Fore.RED))
                     logger.info(
                         "PlaywrightDM row_discard idx=%d reason=click_failed first_line=%s",
                         row_idx,
@@ -333,12 +342,27 @@ class PlaywrightDMClient:
 
                 # DIAGNOSTICO: Verificar estado inmediatamente tras click
                 self._log_navigation_state("POST_CLICK")
+                print(f"[PlaywrightDM] URL post-click: {page.url}")
 
                 opened = self._wait_thread_open(page)
                 composer = self._find_composer(page) if opened else None
-                if composer is None:
+
+                # PROBE: Estado del thread
+                is_url_thread = "/direct/t/" in (page.url or "")
+                messages_visible = self._collect_message_nodes(page).count() > 0
+                print(style_text(f"[PlaywrightDM] PROBE: thread abierto = {opened or is_url_thread}", color=Fore.CYAN))
+                print(style_text(f"[PlaywrightDM] PROBE: composer visible = {composer is not None}", color=Fore.CYAN))
+                print(style_text(f"[PlaywrightDM] PROBE: hay mensajes visibles = {messages_visible}", color=Fore.CYAN))
+                print(f"[PlaywrightDM] URL de thread: {is_url_thread}")
+
+                # REQUISITO: Si el thread está abierto (por URL o indicadores), permitir captura
+                # aunque el composer no sea visible aún.
+                if composer is None and not is_url_thread:
+                    # ASSERTION-LIKE LOG
+                    print(style_text(f"[PlaywrightDM] Fila {row_idx+1} DESCARTADA: No se detectó thread abierto ni composer.", color=Fore.YELLOW))
+                    self._log_navigation_state(f"DISCARDING_THREAD_IDX_{row_idx}")
                     logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_composer first_line=%s",
+                        "PlaywrightDM row_discard idx=%d reason=no_composer_and_no_thread_url first_line=%s",
                         row_idx,
                         first_line[:120],
                     )
@@ -346,6 +370,9 @@ class PlaywrightDMClient:
                     continue
 
                 title = _extract_header_title(page) or first_line
+                # ID Sintetico para diagnostico
+                synth_id = hashlib.sha1(f"{self.username}|{title}".encode()).hexdigest()[:8]
+                print(style_text(f"[PlaywrightDM] Thread CAPTURADO: {title} (SynthID: {synth_id})", color=Fore.GREEN))
                 peer_username = _extract_header_username(page, self.username) or title
                 method = "stable"
                 thread_key = ""
@@ -758,6 +785,8 @@ class PlaywrightDMClient:
         if self._page is not None:
             return self._page
 
+        print(style_text(f"[PlaywrightDM] Iniciando navegador para @{self.username}...", color=Fore.WHITE))
+
         storage_state = self.storage_state_path(self.username)
         if not storage_state.exists():
             raise RuntimeError(f"No hay sesion Playwright guardada para @{self.username}.")
@@ -790,10 +819,13 @@ class PlaywrightDMClient:
         return self._page
 
     def _open_inbox(self) -> None:
+        print(style_text(f"[PlaywrightDM] Abriendo inbox...", color=Fore.WHITE))
         page = self._ensure_page()
         try:
             page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=45_000)
+            print(style_text(f"[PlaywrightDM] Inbox cargado (URL: {page.url})", color=Fore.WHITE))
         except PlaywrightTimeoutError:
+            print(style_text(f"[PlaywrightDM] Timeout abriendo inbox, continuando...", color=Fore.YELLOW))
             pass
         self._dismiss_overlays(page)
         self._assert_logged_in(page)
@@ -1063,7 +1095,9 @@ class PlaywrightDMClient:
         Probe de diagnóstico para saber exactamente donde estamos y qué vemos.
         """
         try:
-            page = self._ensure_page()
+            if self._page is None:
+                return
+            page = self._page
             url = page.url or ""
             in_inbox = "/direct/inbox/" in url
             in_thread = "/direct/t/" in url
@@ -1073,14 +1107,25 @@ class PlaywrightDMClient:
                 try:
                     # check if it exists in DOM at all
                     count = page.locator(selector).count()
-                    visible = page.locator(selector).is_visible() if count > 0 else False
-                    composer_results[selector] = {"exists": count > 0, "visible": visible}
+                    visible = page.locator(selector).first.is_visible() if count > 0 else False
+                    composer_results[selector] = {"count": count, "visible": visible}
                 except Exception as e:
                     composer_results[selector] = {"error": str(e)}
 
+            message_results = {}
+            for selector in _MESSAGE_NODE_SELECTORS:
+                try:
+                    count = page.locator(selector).count()
+                    visible = page.locator(selector).first.is_visible() if count > 0 else False
+                    message_results[selector] = {"count": count, "visible": visible}
+                except Exception as e:
+                    message_results[selector] = {"error": str(e)}
+
             logger.info(
-                "PlaywrightDM diagnostic_probe label=%s url=%s in_inbox=%s in_thread=%s has_composer=%s details=%s",
-                label, url, in_inbox, in_thread, any(d.get("visible") for d in composer_results.values()), composer_results
+                "PlaywrightDM diagnostic_probe label=%s url=%s in_inbox=%s in_thread=%s has_composer=%s composer_details=%s message_details=%s",
+                label, url, in_inbox, in_thread,
+                any(d.get("visible") for d in composer_results.values() if isinstance(d, dict)),
+                composer_results, message_results
             )
         except Exception as e:
             logger.error("Error in PlaywrightDM diagnostic_probe: %s", e)
