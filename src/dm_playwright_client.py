@@ -445,6 +445,8 @@ class PlaywrightDMClient:
                     "row_selector": row_selector_used,
                     "created_at": time.time(),
                 }
+                # DIAGNOSTICO: Marcamos como abierto para evitar re-aperturas inmediatas
+                self._current_thread_id = thread_key
                 logger.info(
                     "PlaywrightDM thread_capture idx=%d key=%s method=%s title=%s peer=%s composer_ok=%s",
                     row_idx,
@@ -702,14 +704,17 @@ class PlaywrightDMClient:
 
     def get_messages(self, thread: ThreadLike, amount: int = 20, *, log: bool = True) -> List[MessageLike]:
         page = self._ensure_page()
+        print(style_text(f"[PlaywrightDM] get_messages para thread {thread.id}", color=Fore.WHITE))
         self._open_thread(thread)
 
         # Esperar a que los mensajes se hidraten
         try:
             # Esperar a que aparezca al menos un nodo de mensaje
             msg_selector = _MESSAGE_NODE_SELECTORS[0]
-            page.wait_for_selector(f"main {msg_selector}, div[role='main'] {msg_selector}", timeout=2000)
+            print(style_text(f"[PlaywrightDM] Esperando hidratacion de mensajes ({msg_selector})...", color=Fore.WHITE))
+            page.wait_for_selector(f"main {msg_selector}, div[role='main'] {msg_selector}", timeout=3000)
         except Exception:
+            print(style_text(f"[PlaywrightDM] Timeout esperando hidratacion", color=Fore.YELLOW))
             pass
 
         nodes = self._collect_message_nodes(page)
@@ -1010,7 +1015,14 @@ class PlaywrightDMClient:
 
     def _open_thread(self, thread: ThreadLike) -> None:
         if self._current_thread_id == thread.id:
-            return
+            print(style_text(f"[PlaywrightDM] _open_thread: Thread {thread.id} ya esta abierto (current_thread_id match)", color=Fore.CYAN))
+            # Verificación extra: ¿seguimos en la URL correcta?
+            if "/direct/t/" in (self._page.url or "") and thread.id in self._page.url:
+                return
+            else:
+                print(style_text(f"[PlaywrightDM] _open_thread: URL no coincide, forzando re-apertura", color=Fore.YELLOW))
+
+        print(style_text(f"[PlaywrightDM] _open_thread: Abriendo thread {thread.id}", color=Fore.WHITE))
         page = self._ensure_page()
         opened = False
         if thread.link:
@@ -1165,11 +1177,13 @@ class PlaywrightDMClient:
         NO acepta header u otros elementos como éxito.
         """
         logger.info("PlaywrightDM wait_thread_open starting timeout=%dms", timeout_ms)
+        print(style_text(f"[PlaywrightDM] Esperando composer visible (timeout {timeout_ms}ms)...", color=Fore.WHITE))
         for selector in _COMPOSER_SELECTORS:
             try:
                 logger.info("PlaywrightDM wait_thread_open checking selector=%s", selector)
                 page.wait_for_selector(selector, timeout=timeout_ms // len(_COMPOSER_SELECTORS))
                 logger.info("PlaywrightDM wait_thread_open success selector=%s", selector)
+                print(style_text(f"[PlaywrightDM] Composer detectado con: {selector}", color=Fore.GREEN))
                 return True
             except Exception as e:
                 logger.info("PlaywrightDM wait_thread_open failed selector=%s reason=timeout_or_error", selector)

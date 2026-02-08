@@ -290,11 +290,15 @@ def _save_conversation_engine() -> None:
     if _CONVERSATION_ENGINE_CACHE is None:
         return
     try:
+        count = len(_CONVERSATION_ENGINE_CACHE.get("conversations", {}))
+        print(style_text(f"[Persistencia] Guardando {count} conversaciones en conversation_engine.json...", color=Fore.WHITE))
         _CONVERSATION_ENGINE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _CONVERSATION_ENGINE_FILE.write_text(
             json.dumps(_CONVERSATION_ENGINE_CACHE, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        print(style_text(f"[Persistencia] Guardado OK. Ruta: {_CONVERSATION_ENGINE_FILE}", color=Fore.GREEN))
     except Exception as exc:
+        print(style_text(f"[Persistencia] ERROR guardando: {exc}", color=Fore.RED))
         logger.warning("Error guardando conversation_engine.json: %s", exc, exc_info=False)
 
 
@@ -327,6 +331,7 @@ def _update_conversation_state(
     updates: Dict[str, Any],
     recipient_username: Optional[str] = None,
 ) -> Dict[str, Any]:
+    print(style_text(f"[Persistencia] Actualizando estado de thread {thread_id} (recipient: {recipient_username})", color=Fore.WHITE))
     engine = _load_conversation_engine()
     conversations = engine.setdefault("conversations", {})
     key = _get_conversation_key(account, thread_id)
@@ -401,10 +406,12 @@ def _load_all_conversations_to_memory(
         try:
             messages = client.get_messages(thread, amount=20)
         except Exception as exc:
+            print(style_text(f"[Memoria] ERROR leyendo mensajes de thread {thread_id}: {exc}", color=Fore.RED))
             logger.debug("No se pudieron obtener mensajes del thread %s: %s", thread_id, exc, exc_info=False)
             continue
         
         if not messages:
+            print(style_text(f"[Memoria] Thread {thread_id} sin mensajes, saltando...", color=Fore.YELLOW))
             continue
         
         # Obtener información del participante
@@ -1948,7 +1955,7 @@ def _client_for(username: str):
     if not account:
         raise RuntimeError(f"No se encontro la cuenta {username}.")
     logger.info("autoresponder_dm_engine=playwright account=@%s", username)
-    client = PlaywrightDMClient(account=account, headless=True)
+    client = PlaywrightDMClient(account=account, headless=False)
     try:
         client.ensure_ready()
     except Exception:
@@ -4863,10 +4870,10 @@ def _process_inbox(
             continue
         messages = client.get_messages(thread, amount=10)
         if not messages:
-            print(style_text(f"[PlaywrightDM] Thread {thread_id} sin mensajes (omitido)", color=Fore.YELLOW))
+            print(style_text(f"[Barrido] Thread {thread_id} sin mensajes (omitido)", color=Fore.YELLOW))
             # PROBE: ¿Estamos dentro del thread aunque no haya mensajes?
             # Intentamos persistir al menos el ID para seguimiento de diagnóstico
-            _update_conversation_state(user, thread_id, {"updated_at": time.time()})
+            _update_conversation_state(user, thread_id, {"updated_at": time.time()}, recipient_username=_resolve_username(client, thread, None))
             continue
         last = _latest_message(messages)
         if not last:
