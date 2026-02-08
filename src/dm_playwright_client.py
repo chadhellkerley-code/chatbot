@@ -298,164 +298,48 @@ class PlaywrightDMClient:
                 row = rows.nth(row_idx)
                 lines = self._row_lines(row)
                 first_line = lines[0] if lines else ""
-                if not lines:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_text",
-                        row_idx,
-                    )
-                    idx += 1
-                    continue
-                lowered = first_line.strip().lower()
-                if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje"}:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=header_tab first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
+
                 if not self._row_is_valid(row):
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=row_invalid first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
                     idx += 1
                     continue
+
                 if filter_unread and _thread_unread_count(row) <= 0:
                     idx += 1
                     continue
-                try:
-                    row.scroll_into_view_if_needed(timeout=2_000)
-                except Exception:
-                    pass
-                try:
-                    print(style_text(f"[PlaywrightDM] Click en fila {row_idx+1}/{total}: {first_line[:50]}...", color=Fore.WHITE))
-                    row.click()
-                except Exception as e:
-                    print(style_text(f"[PlaywrightDM] Click fallido en fila {row_idx+1}: {e}", color=Fore.RED))
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=click_failed first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
 
-                # DIAGNOSTICO: Verificar estado inmediatamente tras click
-                self._log_navigation_state("POST_CLICK")
-                print(f"[PlaywrightDM] URL post-click: {page.url}")
+                # DISCOVERY MODO LECTURA: No clickeamos aquí.
+                # El click ocurrirá en get_messages -> _open_thread.
+                title = first_line
+                synth_id = hashlib.sha1(f"{self.username}|{title}".encode()).hexdigest()[:16]
+                thread_key = f"stable_{synth_id}"
 
-                opened = self._wait_thread_open(page)
-                composer = self._find_composer(page) if opened else None
-
-                # PROBE: Estado del thread
-                is_url_thread = "/direct/t/" in (page.url or "")
-
-                # Intentar esperar un momento si la URL indica thread pero no hay mensajes
-                if is_url_thread and self._collect_message_nodes(page).count() == 0:
-                    page.wait_for_timeout(1500)
-
-                msg_nodes = self._collect_message_nodes(page)
-                messages_visible = msg_nodes.count() > 0
-
-                print(style_text(f"[PlaywrightDM] PROBE: thread abierto = {opened or is_url_thread}", color=Fore.CYAN))
-                print(style_text(f"[PlaywrightDM] PROBE: composer visible = {composer is not None}", color=Fore.CYAN))
-                print(style_text(f"[PlaywrightDM] PROBE: hay mensajes visibles = {messages_visible}", color=Fore.CYAN))
-                if not messages_visible and is_url_thread:
-                    # Diagnóstico profundo si estamos en URL de thread pero no vemos mensajes
-                    try:
-                        main_content = page.locator("main, div[role='main']").first
-                        if main_content.count():
-                            roles = main_content.evaluate("el => Array.from(el.querySelectorAll('*')).map(e => e.getAttribute('role')).filter(Boolean)")
-                            testids = main_content.evaluate("el => Array.from(el.querySelectorAll('*')).map(e => e.getAttribute('data-testid')).filter(Boolean)")
-                            print(style_text(f"[PlaywrightDM] DIAGNOSTICO: roles encontrados en main: {list(set(roles))[:10]}", color=Fore.YELLOW))
-                            print(style_text(f"[PlaywrightDM] DIAGNOSTICO: testids encontrados en main: {list(set(testids))[:10]}", color=Fore.YELLOW))
-                    except Exception:
-                        pass
-
-                print(f"[PlaywrightDM] URL de thread: {is_url_thread}")
-
-                # REQUISITO: Si el thread está abierto (por URL o indicadores), permitir captura
-                # aunque el composer no sea visible aún.
-                if composer is None and not is_url_thread:
-                    # ASSERTION-LIKE LOG
-                    print(style_text(f"[PlaywrightDM] Fila {row_idx+1} DESCARTADA: No se detectó thread abierto ni composer.", color=Fore.YELLOW))
-                    self._log_navigation_state(f"DISCARDING_THREAD_IDX_{row_idx}")
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_composer_and_no_thread_url first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
-
-                title = _extract_header_title(page) or first_line
-                # ID Sintetico para diagnostico
-                synth_id = hashlib.sha1(f"{self.username}|{title}".encode()).hexdigest()[:8]
-                print(style_text(f"[PlaywrightDM] Thread CAPTURADO: {title} (SynthID: {synth_id})", color=Fore.GREEN))
-                peer_username = _extract_header_username(page, self.username) or title
-                method = "stable"
-                thread_key = ""
-                link = ""
-                if "/direct/t/" in (page.url or ""):
-                    thread_id = _extract_thread_id(page.url)
-                    if thread_id:
-                        thread_key = thread_id
-                        method = "real_url"
-                        link = _normalize_direct_link(page.url)
-                if not thread_key:
-                    base = _normalize_key_source(title)
-                    peer_norm = _normalize_key_source(peer_username)
-                    if base and peer_norm:
-                        base = f"{base}|{peer_norm}"
-                    elif not base:
-                        base = peer_norm or _normalize_key_source(first_line)
-                    if base:
-                        stable_id = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
-                        thread_key = f"stable_{stable_id}"
-                if not thread_key:
-                    logger.info(
-                        "PlaywrightDM row_discard idx=%d reason=no_thread_key first_line=%s",
-                        row_idx,
-                        first_line[:120],
-                    )
-                    idx += 1
-                    continue
                 if thread_key in seen:
                     idx += 1
                     continue
+
                 seen.add(thread_key)
-                recipient = title or peer_username or thread_key
+                recipient = title
                 user = UserLike(pk=recipient, id=recipient, username=recipient)
                 thread = ThreadLike(
                     id=thread_key,
                     pk=thread_key,
                     users=[user],
                     unread_count=_thread_unread_count(row),
-                    link=link,
-                    title=title or recipient,
+                    link="",
+                    title=title,
                 )
+
                 threads.append(thread)
                 self._thread_cache[thread_key] = thread
                 self._thread_cache_meta[thread_key] = {
-                    "title": title or "",
-                    "peer_username": peer_username or "",
+                    "title": title,
+                    "peer_username": title,
                     "row_index": row_idx,
                     "row_selector": row_selector_used,
                     "created_at": time.time(),
                 }
-                # DIAGNOSTICO: Marcamos como abierto para evitar re-aperturas inmediatas
-                self._current_thread_id = thread_key
-                logger.info(
-                    "PlaywrightDM thread_capture idx=%d key=%s method=%s title=%s peer=%s composer_ok=%s",
-                    row_idx,
-                    thread_key,
-                    method,
-                    title or "",
-                    peer_username or "",
-                    True,
-                )
+
+                print(style_text(f"[PlaywrightDM] Chat identificado: {title} (ID: {thread_key[:12]})", color=Fore.WHITE))
                 idx += 1
 
             if len(threads) >= amount:
@@ -556,47 +440,51 @@ class PlaywrightDMClient:
             return False
         first_line = lines[0].strip()
         lowered = first_line.lower()
-        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje"}:
+
+        # Filtros de exclusión conocidos (headers, tabs, botones de búsqueda)
+        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje", "solicitudes", "principal"}:
             return False
-        # Tokens específicos de UI de Notas (removido "nota" singular suelto para evitar falsos positivos)
+
+        # Tokens específicos de UI de Notas
         notes_tokens = ("tu nota", "primera nota", "compartir una nota", "notas", "notes", "share a note")
-        # Aplicar filtro principalmente sobre first_line para evitar falsos descartes por snippet
         if any(token in lowered for token in notes_tokens):
             return False
+
         try:
             aria = (row.get_attribute("aria-label") or "").lower()
             if any(token in aria for token in notes_tokens):
                 return False
         except Exception:
             pass
+
+        # RELAXED VALIDATION: Si tiene texto y no es un filtro de exclusión, lo consideramos candidato.
+        # Instagram cambia constantemente los selectores internos (time, badges), así que priorizamos
+        # la existencia de contenido textual.
+
         signals = 0
         try:
-            if row.locator("time").count() > 0:
+            # Señal 1: Presencia de timestamp o indicadores de tiempo
+            if row.locator("time").count() > 0 or row.locator("span:has-text('h')").count() > 0 or row.locator("span:has-text('m')").count() > 0:
                 signals += 1
         except Exception:
             pass
+
         try:
+            # Señal 2: Indicadores de mensajes no leídos
             aria = (row.get_attribute("aria-label") or "").lower()
-            if any(token in aria for token in _UNREAD_HINTS):
+            if any(token in aria for token in _UNREAD_HINTS) or row.locator("span[aria-label*='unread']").count() > 0:
                 signals += 1
         except Exception:
             pass
-        try:
-            if row.locator("span[aria-label*='unread'], span[aria-label*='sin leer'], span[aria-label*='no leido']").count():
-                signals += 1
-        except Exception:
-            pass
-        try:
-            if row.locator("div[dir='auto'], span[dir='auto']").count() > 1:
-                signals += 1
-        except Exception:
-            pass
-        if len(lines) >= 2 and signals >= 1:
-            return True
-        if len(lines) == 1 and signals >= 1:
+
+        # PROBE LOG: Para diagnosticar por qué se aceptan o rechazan filas
+        if len(lines) >= 1:
+            # Si tiene al menos una línea y parece un nombre de usuario/título, es válido.
+            # Los nombres de usuario en IG suelen no tener espacios o ser nombres propios.
+            logger.debug("PlaywrightDM checking row: first_line=%s signals=%d", first_line[:30], signals)
             return True
 
-        logger.info("PlaywrightDM row_is_valid=False first_line=%s signals=%d lines_count=%d", first_line[:50], signals, len(lines))
+        logger.info("PlaywrightDM row_is_valid=False first_line=%s reason=no_content", first_line[:50])
         return False
 
     def _count_rows_valid(self, rows) -> int:
@@ -1025,40 +913,46 @@ class PlaywrightDMClient:
             pass
 
     def _open_thread(self, thread: ThreadLike) -> None:
-        if self._current_thread_id == thread.id:
-            # Verificación extra: ¿seguimos en la URL correcta?
-            if "/direct/t/" in (self._page.url or "") and thread.id in self._page.url:
-                print(style_text(f"[PlaywrightDM] OK: Saltando navegación, ya estamos en el thread {thread.id}", color=Fore.CYAN))
-                return
-            else:
-                print(style_text(f"[PlaywrightDM] _open_thread: URL ({self._page.url}) no coincide con ID {thread.id}, forzando re-apertura", color=Fore.YELLOW))
-
-        print(style_text(f"[PlaywrightDM] _open_thread: Navegando al thread {thread.id}...", color=Fore.WHITE))
         page = self._ensure_page()
+
+        # PROBE: ¿Ya estamos en el thread correcto?
+        if "/direct/t/" in (page.url or "") and thread.id in page.url:
+            print(style_text(f"[PlaywrightDM] OK: Ya estamos en el thread {thread.id}", color=Fore.CYAN))
+            self._current_thread_id = thread.id
+            return
+
+        print(style_text(f"[PlaywrightDM] _open_thread: Intentando abrir chat '{thread.title}'...", color=Fore.WHITE))
+
         opened = False
-        if thread.link:
-            url = _normalize_direct_link(thread.link)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                opened = True
-            except PlaywrightTimeoutError:
-                opened = False
-        if not opened and thread.id and not thread.id.startswith("stable_"):
+
+        # 1. Intentar navegación directa si tenemos ID real
+        if thread.id and not thread.id.startswith("stable_"):
             url = THREAD_URL_TEMPLATE.format(thread_id=thread.id)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                opened = True
-            except PlaywrightTimeoutError:
-                opened = False
-        if not opened:
-            try:
-                page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=45_000)
+                print(style_text(f"[PlaywrightDM] Navegando a URL directa: {url}", color=Fore.WHITE))
+                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                opened = self._wait_thread_open(page, timeout_ms=5000)
             except Exception:
-                pass
-            opened = self._open_thread_by_cache(thread)
-        if not opened:
-            raise RuntimeError("No se pudo abrir el thread por link o fila.")
+                opened = False
 
+        # 2. Si es ID sintético o la navegación falló, usar el buscador de filas (sidebar)
+        if not opened:
+            print(style_text(f"[PlaywrightDM] Buscando chat en el sidebar...", color=Fore.WHITE))
+            opened = self._open_thread_by_cache(thread)
+
+        # 3. Fallback final: ir a inbox y reintentar sidebar
+        if not opened:
+            print(style_text(f"[PlaywrightDM] Fallback: Recargando inbox...", color=Fore.YELLOW))
+            try:
+                page.goto(INBOX_URL, wait_until="domcontentloaded", timeout=30_000)
+                opened = self._open_thread_by_cache(thread)
+            except Exception:
+                opened = False
+
+        if not opened:
+            raise RuntimeError(f"No se pudo abrir el thread '{thread.title}'")
+
+        self._current_thread_id = thread.id
         self._assert_logged_in(page)
         try:
             page.wait_for_selector("textarea, div[role='textbox']", timeout=12_000)

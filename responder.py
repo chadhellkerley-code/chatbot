@@ -4883,28 +4883,26 @@ def _process_inbox(
     for idx, thread in enumerate(inbox, start=1):
         if STOP_EVENT.is_set():
             break
-        print(style_text(f"[PROBE] Transición a memoria iniciada para thread {idx}/{total_threads}", color=Fore.CYAN, bold=True))
-        print(style_text(f"[Barrido] Thread {idx}/{total_threads} en progreso", color=Fore.CYAN))
-        thread_id_val = getattr(thread, "id", None) or getattr(thread, "pk", None)
-        if thread_id_val is None:
-            continue
-        thread_id = str(thread_id_val)
-        print(style_text(f"[Barrido] Procesando Thread ID: {thread_id}", color=Fore.CYAN))
-        logger.debug("PlaywrightDM processing thread %s", thread_id)
+
+        thread_id = str(getattr(thread, "id", "unknown"))
+        recipient_initial = getattr(thread, "title", "unknown")
+
+        print(style_text(f"\n[Ciclo] === INICIANDO CICLO {idx}/{total_threads} para @{recipient_initial} ===", color=Fore.CYAN, bold=True))
+
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
+            print(style_text(f"[Ciclo] Thread saltado (no en lista permitida)", color=Fore.YELLOW))
             continue
 
-        # PERSISTENCIA INMEDIATA: Sincronizar memoria apenas se identifica el thread
+        # PASO 2 y 3: Hacer click y sincronizar información de inmediato
+        # get_messages realizará el click si no está abierto
+        messages = client.get_messages(thread, amount=10)
+
         recipient_username = _resolve_username(client, thread, None)
-        print(style_text(f"[Persistencia] Sincronización INICIAL para @{recipient_username} (Thread: {thread_id})", color=Fore.WHITE))
+        print(style_text(f"[Persistencia] Sincronización de apertura para @{recipient_username}", color=Fore.WHITE))
         _update_conversation_state(user, thread_id, {"updated_at": time.time()}, recipient_username=recipient_username)
 
-        messages = client.get_messages(thread, amount=10)
         if not messages:
-            print(style_text(f"[Barrido] Thread {thread_id} sin mensajes (omitido)", color=Fore.YELLOW))
-            # PROBE: ¿Estamos dentro del thread aunque no haya mensajes?
-            # Intentamos persistir al menos el ID para seguimiento de diagnóstico
-            _update_conversation_state(user, thread_id, {"updated_at": time.time()}, recipient_username=_resolve_username(client, thread, None))
+            print(style_text(f"[Ciclo] Thread sin mensajes o no se pudo leer (Thread: {thread_id}).", color=Fore.YELLOW))
             continue
         last = _latest_message(messages)
         if not last:
@@ -5125,7 +5123,11 @@ def _process_inbox(
         index = stats.record_success(user)
         logger.info("Respuesta enviada por @%s en hilo %s (etapa: %s)", user, thread_id, stage)
         _print_response_summary(index, user, recipient_username, True, calendar_status_line)
-    print(style_text(f"[Barrido] Scan completo para @{user}", color=Fore.GREEN))
+
+        print(style_text(f"[Ciclo] Thread {idx}/{total_threads} COMPLETADO para @{recipient_username}", color=Fore.GREEN, bold=True))
+        print(style_text(f"------------------------------------------------------------", color=Fore.WHITE))
+
+    print(style_text(f"[Barrido] Scan completo para @{user}. Procesados: {total_threads}", color=Fore.GREEN, bold=True))
 
 def _print_bot_summary(stats: BotStats) -> None:
     print(full_line(color=Fore.MAGENTA))
