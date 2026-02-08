@@ -90,6 +90,11 @@ NO_DM_SKIP_DETAIL = "Perfil sin botón de mensaje / no permite DM"
 NO_DM_SKIP_LOG = f"skip | no_dm | {NO_DM_SKIP_DETAIL}"
 NO_DM_SEND_METHOD = "skip_no_dm"
 
+EXACT_USER_SKIP_REASON = "EXACT_USER_NOT_FOUND"
+EXACT_USER_SKIP_DETAIL = "No se encontró coincidencia exacta para el username"
+EXACT_USER_SKIP_LOG = f"skip | exact_match | {EXACT_USER_SKIP_DETAIL}"
+EXACT_USER_SEND_METHOD = "skip_exact_match"
+
 
 class HumanInstagramSender:
     def __init__(self, headless: bool = True) -> None:
@@ -220,69 +225,64 @@ class HumanInstagramSender:
             await self._type_search_handle(field, normalized)
         try:
             # Aumentamos espera para que IG cargue resultados 
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(3000)
         except Exception:
             pass
 
-        # Estrategia 1: Buscar por selectores estándar (globales)
-        buttons = page.locator("[role='button']")
-        candidate = buttons.filter(has_text=re.compile(rf"^{re.escape(normalized)}$", re.IGNORECASE))
+        # Estrategia de selección exacta:
+        # Buscamos dentro del diálogo de resultados
+        results_container = page.locator("div[role='dialog']")
+        if await results_container.count() == 0:
+            results_container = page # Fallback al body si no hay dialog explícito
+
+        # Buscamos todos los elementos que podrían ser una fila de resultado
+        # Generalmente son div[role='button'] o li
+        rows = results_container.locator("div[role='button'], li")
+        row_count = await rows.count()
         
         selection: Optional[Locator] = None
-        if await candidate.count() > 0:
-            selection = candidate.first
-        else:
-            # Estrategia 2: Buscar contenedor directo que tenga el texto
-            direct_text = page.locator(f"div[role='dialog'] div").filter(has_text=normalized)
-            if await direct_text.count() > 0:
-                selection = direct_text.last # Usamos last porque suele ser el nodo texto mas profundo
-            
-        if selection is None:
-             # Estrategia 4: Buscar inputs de tipo radio/checkbox GLOBALMENTE
-            radio_inputs = page.locator("input[type='radio'], input[type='checkbox']")
-            if await radio_inputs.count() > 0:
-                 logger.info("Encontrados inputs de selección (radio/checkbox). Clickeando el primero.")
-                 selection = radio_inputs.first
-                 # A veces hay que clickear el padre o label
-                 try:
-                     await selection.click(force=True)
-                     return True
-                 except: 
-                     pass
 
-             # Estrategia 5: Fallback a lista genérica GLOBAL
-            items = page.locator("[role='button'], li")
-            visible_count = await items.count()
-            print("debug Resultados visibles:", visible_count)
-            limit = min(visible_count, 5)
-            for idx in range(limit):
-                try:
-                    text_value = (await items.nth(idx).inner_text() or "").strip().lower()
-                except Exception:
-                    continue
-                if normalized in text_value:
-                    selection = items.nth(idx)
-                    break
-            if selection is None and visible_count > 0:
-                selection = items.first
-        
-        if selection is None:
-            # Ultimo intento desesperado: Buscar el texto literal y clickearlo
-            logger.info(f"Búsqueda estándar falló. Intentando clic por texto: {normalized}")
+        for i in range(row_count):
+            row = rows.nth(i)
+            # El username suele estar en un span o div dir="auto"
+            # Intentamos encontrar un descendiente que tenga EXACTAMENTE el texto buscado
+            # También revisamos el alt de la imagen si existe
+
+            # 1. Buscar spans con texto exacto
+            spans = row.locator("span, div").filter(has_text=re.compile(rf"^{re.escape(normalized)}$", re.IGNORECASE))
+            if await spans.count() > 0:
+                # Verificar que el texto sea realmente idéntico (filter puede ser engañoso con sub-elementos)
+                for j in range(await spans.count()):
+                    if (await spans.nth(j).inner_text() or "").strip().lower() == normalized:
+                        selection = row
+                        break
+            
+            if selection: break
+
+            # 2. Buscar en el alt de la imagen de perfil
+            img = row.locator("img")
+            if await img.count() > 0:
+                alt = (await img.first.get_attribute("alt") or "").lower()
+                if normalized in alt and "foto" in alt:
+                    # El alt suele ser "Foto del perfil de <username>"
+                    # Si el username está en el alt, es una buena señal, pero validamos con spans internos si es posible
+                    # Por ahora, si el normalized está en el alt y no hay otros spans, podría valer,
+                    # pero el requerimiento pide selección EXACTA.
+                    # Vamos a ser estrictos y preferir la validación de texto visible.
+                    pass
+
+        if selection:
+            logger.info("Usuario con match exacto encontrado: %s", normalized)
             try:
-                # Buscamos en todo el dialogo
-                fallback = page.locator("div[role='dialog']").get_by_text(normalized, exact=False).first
-                await fallback.click()
+                await selection.scroll_into_view_if_needed(timeout=2_000)
+                await selection.click()
                 return True
-            except:
+            except Exception as e:
+                logger.error("Error al clickear el usuario encontrado: %s", e)
                 return False
 
-        try:
-            await selection.scroll_into_view_if_needed(timeout=2_000)
-        except Exception:
-            pass
-        await selection.click()
-        return True
+        logger.warning("No se encontró ningún usuario con match exacto para: %s", normalized)
+        return False
 
     async def _confirm_next(self, page: Page) -> bool:
         # 1. Verificar si ya estamos en el chat (si al seleccionar usuario nos llevó directo)
@@ -500,6 +500,8 @@ class HumanInstagramSender:
         toast_negative = re.compile(r"(not sent|no se pudo enviar|no enviado)", re.IGNORECASE)
 
         message_selectors = [
+            "[data-testid='own']",
+            "[data-testid='message-bubble-outgoing']",
             "div[role='list'] div[role='listitem']",
             "div[role='list'] div[role='row']",
             "div[role='log'] div[role='listitem']",
@@ -532,8 +534,12 @@ class HumanInstagramSender:
                     toast = page.locator(selector).last
                     if await toast.count() > 0:
                         toast_text = (await toast.inner_text() or "").strip()
-                        if toast_text and toast_success.search(toast_text) and not toast_negative.search(toast_text):
-                            return True, "toast_sent"
+                        if toast_text:
+                            if toast_negative.search(toast_text):
+                                logger.warning("Detalle: Error detectado en toast: %s", toast_text)
+                                return False, f"error_toast: {toast_text}"
+                            if toast_success.search(toast_text):
+                                return True, "toast_sent"
                 except Exception:
                     continue
             if composer is not None:
@@ -550,18 +556,48 @@ class HumanInstagramSender:
                     items = page.locator(sel)
                     count = await items.count()
                     if count > 0:
-                        start = max(0, count - 3)
+                        # Revisamos los últimos 5 mensajes para mayor seguridad
+                        start = max(0, count - 5)
                         for idx in range(start, count):
                             item = items.nth(idx)
                             try:
                                 text_value = await item.inner_text()
                             except Exception:
                                 text_value = await item.text_content() or ""
+
                             if _contains_snippet(text_value) or _contains_prefix(text_value):
-                                return True, "message_present"
+                                # Verificación determinística de que es OUTGOING
+                                is_own = False
+                                try:
+                                    if await item.get_attribute("data-testid") == "own":
+                                        is_own = True
+                                    elif await item.locator("[data-testid='own']").count() > 0:
+                                        is_own = True
+                                    else:
+                                        # Heurística de posición (derecha del thread)
+                                        box = await item.bounding_box()
+                                        if box:
+                                            viewport = page.viewport_size
+                                            if viewport and (box['x'] + box['width']/2) > (viewport['width'] / 2):
+                                                is_own = True
+                                except Exception:
+                                    pass
+
+                                if is_own:
+                                    return True, "message_present_outgoing"
+                                else:
+                                    # Si encontramos el texto pero es del otro lado, seguimos buscando
+                                    continue
+
                         matches = items.filter(has_text=snippet)
                         if await matches.count() > 0:
-                            return True, "message_present"
+                            # Si el filter encuentra algo, intentamos validar el último match
+                            last_match = matches.last
+                            box = await last_match.bounding_box()
+                            if box:
+                                viewport = page.viewport_size
+                                if viewport and (box['x'] + box['width']/2) > (viewport['width'] / 2):
+                                    return True, "message_present_outgoing_heuristic"
                 except Exception:
                     continue
 
@@ -680,7 +716,8 @@ class HumanInstagramSender:
                 raise RuntimeError("No se pudo abrir el dialogo de nuevo mensaje (/direct/new).")
 
             if not await self._search_and_select(page, normalized_target):
-                raise RuntimeError("No se pudo seleccionar el usuario en el dialogo.")
+                logger.info(EXACT_USER_SKIP_LOG)
+                return EXACT_USER_SEND_METHOD
 
             if not await self._confirm_next(page):
                 raise RuntimeError("No se pudo abrir el chat (Next/Chat).")
@@ -736,6 +773,22 @@ class HumanInstagramSender:
                     return False, NO_DM_SKIP_REASON, payload
                 return (False, NO_DM_SKIP_REASON) if return_detail else False
 
+            if send_method == EXACT_USER_SEND_METHOD:
+                payload.update(
+                    {
+                        "engine": "playwright_async",
+                        "url": page.url if page else "",
+                        "strategy": used_strategy,
+                        "send_method": EXACT_USER_SEND_METHOD,
+                        "skip_reason": EXACT_USER_SKIP_REASON,
+                        "skip_detail": EXACT_USER_SKIP_DETAIL,
+                        "skipped": True,
+                    }
+                )
+                if return_payload:
+                    return False, EXACT_USER_SKIP_REASON, payload
+                return (False, EXACT_USER_SKIP_REASON) if return_detail else False
+
             composer = await self._composer(page)
             ok, reason = await self._confirm_message_sent(page, text, composer=composer)
             payload["verified"] = bool(ok)
@@ -760,18 +813,16 @@ class HumanInstagramSender:
                     reason = reason_retry
                     payload["verified"] = True
             if not ok:
-                if reason in {"message_not_present_after_send", "composer_not_cleared"}:
-                    current_url = page.url if page else ""
-                    detail = "sent_request" if "/direct/requests" in (current_url or "") else "sent_unverified"
-                    payload["verification_reason"] = reason
-                    payload["detail"] = detail
-                    if detail == "sent_unverified":
-                        payload["sent_unverified"] = True
-                        payload["reason_code"] = "SENT_UNVERIFIED"
-                    if return_payload:
-                        return True, detail, payload
-                    return (True, detail) if return_detail else True
-                raise RuntimeError(reason)
+                # Si llegamos aquí sin 'ok', es que falló la verificación determinística.
+                # Para cumplir con el requerimiento de 'no suposiciones', devolvemos False.
+                payload["verified"] = False
+                payload["verification_reason"] = reason
+                detail = reason or "verification_failed"
+                payload["detail"] = detail
+                logger.warning("Envío no verificado: %s", reason)
+                if return_payload:
+                    return False, detail, payload
+                return (False, detail) if return_detail else False
 
             storage_path = Path(BASE_PROFILES) / username / "storage_state.json"
             try:
