@@ -233,46 +233,59 @@ class HumanInstagramSender:
         # Buscamos dentro del diálogo de resultados
         results_container = page.locator("div[role='dialog']")
         if await results_container.count() == 0:
-            results_container = page # Fallback al body si no hay dialog explícito
+            # Fallback a contenedores comunes de búsqueda
+            results_container = page.locator("div[aria-label='Nuevo mensaje'], div[aria-label='New message'], main")
+            if await results_container.count() == 0:
+                results_container = page
 
         # Buscamos todos los elementos que podrían ser una fila de resultado
         # Generalmente son div[role='button'] o li
+        # Limitamos a los primeros 10 resultados para evitar ruido
         rows = results_container.locator("div[role='button'], li")
-        row_count = await rows.count()
+        try:
+            row_count = await rows.count()
+        except Exception:
+            row_count = 0
         
         selection: Optional[Locator] = None
+        logger.debug("Escaneando %d posibles filas de resultados para match exacto con '%s'", row_count, normalized)
 
-        for i in range(row_count):
+        for i in range(min(row_count, 15)):
             row = rows.nth(i)
-            # El username suele estar en un span o div dir="auto"
-            # Intentamos encontrar un descendiente que tenga EXACTAMENTE el texto buscado
-            # También revisamos el alt de la imagen si existe
+            try:
+                if not await row.is_visible():
+                    continue
 
-            # 1. Buscar spans con texto exacto
-            spans = row.locator("span, div").filter(has_text=re.compile(rf"^{re.escape(normalized)}$", re.IGNORECASE))
-            if await spans.count() > 0:
-                # Verificar que el texto sea realmente idéntico (filter puede ser engañoso con sub-elementos)
-                for j in range(await spans.count()):
-                    if (await spans.nth(j).inner_text() or "").strip().lower() == normalized:
-                        selection = row
-                        break
-            
-            if selection: break
+                # El username suele estar en un span o div
+                # Requisito Fase 2: Coincidencia EXACTA (case-insensitive)
 
-            # 2. Buscar en el alt de la imagen de perfil
-            img = row.locator("img")
-            if await img.count() > 0:
-                alt = (await img.first.get_attribute("alt") or "").lower()
-                if normalized in alt and "foto" in alt:
-                    # El alt suele ser "Foto del perfil de <username>"
-                    # Si el username está en el alt, es una buena señal, pero validamos con spans internos si es posible
-                    # Por ahora, si el normalized está en el alt y no hay otros spans, podría valer,
-                    # pero el requerimiento pide selección EXACTA.
-                    # Vamos a ser estrictos y preferir la validación de texto visible.
-                    pass
+                # Obtenemos todos los spans y divs internos que podrían contener el texto
+                candidates = row.locator("span, div")
+                cand_count = await candidates.count()
+
+                for j in range(cand_count):
+                    cand = candidates.nth(j)
+                    # Usamos text_content() para evitar ruidos de sub-elementos si los hay,
+                    # aunque inner_text() suele ser más "lo que ve el usuario".
+                    try:
+                        val = (await cand.text_content() or "").strip().lower()
+                        if val == normalized:
+                            # Encontrado match exacto en un elemento interno
+                            selection = row
+                            logger.info("Match exacto encontrado en elemento %d de la fila %d: '%s'", j, i, val)
+                            break
+                    except Exception:
+                        continue
+
+                if selection:
+                    break
+
+            except Exception as e:
+                logger.debug("Error procesando fila %d: %s", i, e)
+                continue
 
         if selection:
-            logger.info("Usuario con match exacto encontrado: %s", normalized)
+            logger.info("Seleccionando usuario con match exacto: %s", normalized)
             try:
                 await selection.scroll_into_view_if_needed(timeout=2_000)
                 await selection.click()

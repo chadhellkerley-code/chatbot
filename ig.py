@@ -1709,11 +1709,12 @@ def menu_send_rotating(
                 else:
                     success_flag, info = send_result, None
                 skip_reason = (payload.get("skip_reason") or info or "").strip().upper()
-                if skip_reason == NO_DM_SKIP_REASON:
+                if skip_reason in (NO_DM_SKIP_REASON, EXACT_USER_SKIP_REASON):
                     success_flag = False
-                    detail = NO_DM_SKIP_DETAIL
-                    reason_code = NO_DM_SKIP_REASON
-                    reason_label = NO_DM_SKIP_DETAIL
+                    is_exact = (skip_reason == EXACT_USER_SKIP_REASON)
+                    detail = EXACT_USER_SKIP_DETAIL if is_exact else NO_DM_SKIP_DETAIL
+                    reason_code = EXACT_USER_SKIP_REASON if is_exact else NO_DM_SKIP_REASON
+                    reason_label = detail
                     scope = "lead"
                     break
                 if success_flag:
