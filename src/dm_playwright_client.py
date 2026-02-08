@@ -330,6 +330,10 @@ class PlaywrightDMClient:
                     )
                     idx += 1
                     continue
+
+                # DIAGNOSTICO: Verificar estado inmediatamente tras click
+                self._log_navigation_state("POST_CLICK")
+
                 opened = self._wait_thread_open(page)
                 composer = self._find_composer(page) if opened else None
                 if composer is None:
@@ -541,6 +545,8 @@ class PlaywrightDMClient:
             return True
         if len(lines) == 1 and signals >= 1:
             return True
+
+        logger.info("PlaywrightDM row_is_valid=False first_line=%s signals=%d lines_count=%d", first_line[:50], signals, len(lines))
         return False
 
     def _count_rows_valid(self, rows) -> int:
@@ -1052,17 +1058,52 @@ class PlaywrightDMClient:
         stable_id = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
         return f"stable_{stable_id}", "stable_id", ""
 
+    def _log_navigation_state(self, label: str) -> None:
+        """
+        Probe de diagnóstico para saber exactamente donde estamos y qué vemos.
+        """
+        try:
+            page = self._ensure_page()
+            url = page.url or ""
+            in_inbox = "/direct/inbox/" in url
+            in_thread = "/direct/t/" in url
+
+            composer_results = {}
+            for selector in _COMPOSER_SELECTORS:
+                try:
+                    # check if it exists in DOM at all
+                    count = page.locator(selector).count()
+                    visible = page.locator(selector).is_visible() if count > 0 else False
+                    composer_results[selector] = {"exists": count > 0, "visible": visible}
+                except Exception as e:
+                    composer_results[selector] = {"error": str(e)}
+
+            logger.info(
+                "PlaywrightDM diagnostic_probe label=%s url=%s in_inbox=%s in_thread=%s has_composer=%s details=%s",
+                label, url, in_inbox, in_thread, any(d.get("visible") for d in composer_results.values()), composer_results
+            )
+        except Exception as e:
+            logger.error("Error in PlaywrightDM diagnostic_probe: %s", e)
+
     def _wait_thread_open(self, page: Page, timeout_ms: int = 6000) -> bool:
         """
         Espera a que el composer esté visible. Solo retorna True si aparece el composer.
         NO acepta header u otros elementos como éxito.
         """
+        logger.info("PlaywrightDM wait_thread_open starting timeout=%dms", timeout_ms)
         for selector in _COMPOSER_SELECTORS:
             try:
-                page.wait_for_selector(selector, timeout=timeout_ms)
+                logger.info("PlaywrightDM wait_thread_open checking selector=%s", selector)
+                page.wait_for_selector(selector, timeout=timeout_ms // len(_COMPOSER_SELECTORS))
+                logger.info("PlaywrightDM wait_thread_open success selector=%s", selector)
                 return True
-            except Exception:
+            except Exception as e:
+                logger.info("PlaywrightDM wait_thread_open failed selector=%s reason=timeout_or_error", selector)
                 continue
+
+        # Log state on failure
+        self._log_navigation_state("WAIT_THREAD_OPEN_FAILURE")
+
         logger.warning(
             "PlaywrightDM wait_thread_open_failed reason=no_composer url=%s",
             (page.url or ""),

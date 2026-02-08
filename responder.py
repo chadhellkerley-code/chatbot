@@ -4833,6 +4833,10 @@ def _process_inbox(
             user,
         )
         return
+
+    total_threads = len(inbox)
+    logger.info("PlaywrightDM inbox_scan_result account=@%s total_found=%d ids=%s",
+                user, total_threads, [getattr(t, "id", None) for t in inbox])
     state.setdefault(user, {})
     max_age_seconds = max(0, int(max_age_days)) * 24 * 3600 if max_age_days is not None else 0
     now = time.time()
@@ -4847,6 +4851,7 @@ def _process_inbox(
         if thread_id_val is None:
             continue
         thread_id = str(thread_id_val)
+        print(f"DEBUG: Processing thread {thread_id}")
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
         messages = client.get_messages(thread, amount=10)
