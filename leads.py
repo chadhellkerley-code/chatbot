@@ -1,18 +1,22 @@
 # leads.py
 # -*- coding: utf-8 -*-
 import csv
+import json
 import logging
 import os
+import queue
 import random
 import re
 import shutil
 import sys
+import threading
 import time
 import unicodedata
 from collections import deque
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from accounts import (
     auto_login_with_saved_password,
@@ -217,7 +221,7 @@ def menu_leads():
         print("3) Ver lista")
         print("4) Eliminar lista")
         print("5) Gestionar plantillas")
-        print("6) Scraping automatico de perfiles")
+        print("6) Filtrado profesional de leads (IA)")
         print("7) Volver\n")
         op=ask("Opcion: ").strip()
         if op=="1":
@@ -242,7 +246,7 @@ def menu_leads():
         elif op=="5":
             menu_templates()
         elif op=="6":
-            _scrape_menu()
+            _lead_filtering_main_menu()
         elif op=="7":
             break
         else:
@@ -250,24 +254,67 @@ def menu_leads():
 
 
 @dataclass
-class ScrapeFilters:
-    min_followers: int
-    max_followers: int
-    min_posts: int
-    max_posts: int
-    privacy: str
-    max_results: int
-    delay: float
+class LeadFilterConfig:
+    name: str
+    min_followers: int = 0
+    max_followers: int = 0
+    min_posts: int = 0
+    max_posts: int = 0
+    privacy: str = "any"  # any, public, private
+    has_link_in_bio: bool = False
+    keywords: List[str] = field(default_factory=list)
+    llm_criterion: str = ""
+    profile_pic_prompt: str = ""
+    target_sex: str = "indifferent"  # male, female, indifferent
+    min_age: int = 0
+    max_age: int = 0
 
 
 @dataclass
-class ScrapedUser:
-    username: str
-    biography: str
-    full_name: str
-    follower_count: int
-    media_count: int
-    is_private: bool
+class LeadFilteringSession:
+    id: str
+    filter_name: str
+    leads_total: int
+    leads_processed: int
+    leads_qualified: List[str]
+    leads_disqualified: List[str]
+    leads_pending: List[str] = field(default_factory=list)
+    status: str = "running"  # running, paused, completed
+    last_updated: float = field(default_factory=time.time)
+
+
+def load_lead_filters() -> List[LeadFilterConfig]:
+    p = Path("storage/lead_filters.json")
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return [LeadFilterConfig(**item) for item in data]
+    except Exception:
+        return []
+
+
+def save_lead_filters(filters: List[LeadFilterConfig]):
+    p = Path("storage/lead_filters.json")
+    data = [asdict(f) for f in filters]
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_filtering_sessions() -> Dict[str, dict]:
+    p = Path("storage/filtering_sessions.json")
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_filtering_session(session: LeadFilteringSession):
+    p = Path("storage/filtering_sessions.json")
+    sessions = load_filtering_sessions()
+    sessions[session.id] = asdict(session)
+    p.write_text(json.dumps(sessions, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 @dataclass
@@ -317,800 +364,6 @@ class DelayController:
         self._last_recorded = now
 
 
-def _scrape_menu() -> None:
-    while True:
-        banner()
-        title("Scraping automático de perfiles")
-        print("1) Scrapear por hashtag")
-        print("2) Scrapear desde perfiles base")
-        print("3) Volver\n")
-        choice = ask("Opción: ").strip() or "3"
-        if choice == "1":
-            _scrape_from_hashtag_flow()
-        elif choice == "2":
-            _scrape_from_profiles_flow()
-        elif choice == "3":
-            break
-        else:
-            warn("Opción inválida."); press_enter()
-
-
-def _scrape_from_hashtag_flow() -> None:
-    username = _choose_scrape_account()
-    if not username:
-        press_enter()
-        return
-    if not _ensure_account_ready(username):
-        press_enter()
-        return
-    hashtag = ask("Hashtag (sin #): ").strip().lstrip("#")
-    if not hashtag:
-        warn("Debés indicar un hashtag.")
-        press_enter()
-        return
-    filters = _prompt_filters()
-    if not filters:
-        return
-    try:
-        client = _client_for_scraping(username)
-    except Exception as exc:
-        warn(str(exc))
-        press_enter()
-        return
-    print(f"Buscando perfiles que usaron #{hashtag}...")
-    results = _run_scrape(
-        lambda cl, progress: _scrape_hashtag(cl, username, hashtag, filters, progress),
-        client,
-        username,
-    )
-    _handle_scrape_results(results)
-
-
-def _scrape_from_profiles_flow() -> None:
-    username = _choose_scrape_account()
-    if not username:
-        press_enter()
-        return
-    if not _ensure_account_ready(username):
-        press_enter()
-        return
-    raw = ask_multiline(
-        "Pegá la lista de perfiles base (uno por línea, sin @)."
-    )
-    base_profiles = [chunk.strip().lstrip("@") for chunk in raw.splitlines() if chunk.strip()]
-    if not base_profiles:
-        warn("No se ingresaron perfiles base.")
-        press_enter()
-        return
-    print("\n¿Qué querés extraer de esos perfiles?")
-    print("1) Seguidores")
-    print("2) Seguidos (following)")
-    mode_choice = ask("Opción (1/2): ").strip() or "1"
-    mode = "followers" if mode_choice == "1" else "following"
-    filters = _prompt_filters()
-    if not filters:
-        return
-    try:
-        client = _client_for_scraping(username)
-    except Exception as exc:
-        warn(str(exc))
-        press_enter()
-        return
-    label = "seguidores" if mode == "followers" else "seguidos"
-    print(f"Buscando {label} que cumplan los filtros...")
-    results = _run_scrape(
-        lambda cl, progress: _scrape_from_profiles(cl, username, base_profiles, mode, filters, progress),
-        client,
-        username,
-    )
-    _handle_scrape_results(results)
-
-
-def _choose_scrape_account() -> Optional[str]:
-    try:
-        records = list_all()
-    except Exception as exc:
-        warn(f"No se pudieron cargar las cuentas: {exc}")
-        return None
-    available: List[Tuple[str, Dict]] = []
-    for acct in records:
-        username = (acct.get("username") or "").strip()
-        if not username:
-            continue
-        available.append((username, acct))
-    if not available:
-        warn("No hay cuentas configuradas.")
-        return None
-    print("Seleccioná la cuenta que se usará para scrapear:")
-    for idx, (username, acct) in enumerate(available, start=1):
-        alias = acct.get("alias") or ""
-        alias_part = f" (alias: {alias})" if alias else ""
-        session_flag = "[sesión]" if has_session(username) else "[sin sesión]"
-        print(f" {idx}) @{username}{alias_part} {session_flag}")
-    print(" (Enter para cancelar)")
-    while True:
-        raw = ask("Cuenta: ").strip()
-        if not raw:
-            warn("Operación cancelada.")
-            return None
-        if raw.isdigit():
-            idx = int(raw)
-            if 1 <= idx <= len(available):
-                return available[idx - 1][0]
-        normalized = raw.lstrip("@").lower()
-        for username, _ in available:
-            if username.lower() == normalized:
-                return username
-        warn("Selección inválida. Probá nuevamente.")
-
-
-def _ensure_account_ready(username: str) -> bool:
-    if not has_session(username):
-        warn(f"@{username} no tiene sesión guardada.")
-        if auto_login_with_saved_password(username) and has_session(username):
-            return _ensure_account_ready(username)
-        if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            if auto_login_with_saved_password(username) and has_session(username):
-                return _ensure_account_ready(username)
-            if prompt_login(username, interactive=False):
-                return _ensure_account_ready(username)
-        return False
-    try:
-        _client_for_scraping(username)
-        return True
-    except Exception as exc:
-        warn(str(exc))
-        if auto_login_with_saved_password(username) and has_session(username):
-            return _ensure_account_ready(username)
-        if ask("¿Reintentar login ahora? (s/N): ").strip().lower() == "s":
-            if auto_login_with_saved_password(username) and has_session(username):
-                return _ensure_account_ready(username)
-            if prompt_login(username, interactive=False):
-                return _ensure_account_ready(username)
-        return False
-
-
-def _client_for_scraping(username: str):
-    account = get_account(username)
-    try:
-        cl = get_instagram_client(account=account)
-    except Exception as exc:
-        raise RuntimeError(f"No se pudo crear el cliente para @{username}: {exc}") from exc
-
-    binding = None
-    try:
-        binding = apply_proxy_to_client(cl, username, account, reason="lead-scraper")
-    except Exception as exc:
-        if account and account.get("proxy_url"):
-            record_proxy_failure(username, exc)
-            raise RuntimeError(
-                f"El proxy configurado para @{username} no respondió: {exc}"
-            ) from exc
-        warn(f"Proxy no disponible para @{username}: {exc}")
-    try:
-        load_into(cl, username)
-    except FileNotFoundError as exc:
-        mark_connected(username, False)
-        raise RuntimeError(
-            f"No hay sesión guardada para @{username}. Usá la opción de login primero."
-        ) from exc
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
-        mark_connected(username, False)
-        raise
-
-    if not has_valid_session_settings(cl):
-        mark_connected(username, False)
-        raise RuntimeError(
-            f"La sesión guardada para @{username} no contiene credenciales activas. Iniciá sesión nuevamente."
-        )
-
-    try:
-        cl.account_info()
-    except Exception as exc:
-        warn(f"No se pudo verificar la sesión de @{username}: {exc}")
-
-    mark_connected(username, True)
-    return cl
-
-
-def _prompt_filters() -> Optional[ScrapeFilters]:
-    print("\nConfigurá los filtros para la extracción:")
-    min_followers = ask_int("Mínimo de seguidores (0 sin mínimo): ", min_value=0, default=0)
-    max_followers = ask_int("Máximo de seguidores (0 sin máximo): ", min_value=0, default=0)
-    if max_followers and max_followers < min_followers:
-        warn("El máximo de seguidores era menor al mínimo. Se invirtieron los valores.")
-        min_followers, max_followers = max_followers, min_followers
-
-    min_posts = ask_int("Mínimo de posteos (0 sin mínimo): ", min_value=0, default=0)
-    max_posts = ask_int("Máximo de posteos (0 sin máximo): ", min_value=0, default=0)
-    if max_posts and max_posts < min_posts:
-        warn("El máximo de posteos era menor al mínimo. Se invirtieron los valores.")
-        min_posts, max_posts = max_posts, min_posts
-
-    print("\nPrivacidad de cuentas a incluir:")
-    print("1) Solo públicas")
-    print("2) Solo privadas")
-    print("3) Ambas")
-    privacy_choice = ask("Opción (3 por defecto): ").strip() or "3"
-    if privacy_choice == "1":
-        privacy = "public"
-    elif privacy_choice == "2":
-        privacy = "private"
-    else:
-        privacy = "any"
-
-    max_results = ask_int("Cantidad máxima de usuarios a scrapear: ", min_value=1, default=50)
-    delay_seconds = ask_int(
-        "Delay entre extracciones (segundos, mínimo 5): ", min_value=5, default=8
-    )
-
-    return ScrapeFilters(
-        min_followers=min_followers,
-        max_followers=max_followers,
-        min_posts=min_posts,
-        max_posts=max_posts,
-        privacy=privacy,
-        max_results=max_results,
-        delay=float(delay_seconds),
-    )
-
-
-def _run_scrape(worker, client, username: str) -> List[ScrapedUser]:
-    working_client = client
-    while True:
-        progress = ScrapeProgress()
-        results: List[ScrapedUser] = []
-        try:
-            with progress:
-                results = worker(working_client, progress)
-        except Exception as exc:
-            if "login" in str(exc).lower():
-                if not _refresh_session(username):
-                    warn(
-                        "Instagram solicitó validar la sesión y no se pudo renovar automáticamente. "
-                        "Iniciá sesión nuevamente desde el menú de cuentas."
-                    )
-                    return []
-                try:
-                    working_client = _client_for_scraping(username)
-                except Exception as refresh_exc:
-                    warn(str(refresh_exc))
-                    return []
-                continue
-            progress.record_issue(f"Error durante el scraping: {exc}")
-            return []
-        except KeyboardInterrupt:
-            progress.stop("ctrl_c")
-            progress.record_issue("Scraping interrumpido manualmente con Ctrl+C.")
-            results = []
-        progress.summarize()
-        return results
-
-
-def _refresh_session(username: str) -> bool:
-    refreshed = False
-    if auto_login_with_saved_password(username) and has_session(username):
-        refreshed = True
-    elif prompt_login(username, interactive=False) and has_session(username):
-        refreshed = True
-    if refreshed:
-        ok(f"Sesión de @{username} renovada correctamente.")
-    return refreshed
-
-
-class ScrapeProgress:
-    def __init__(self) -> None:
-        self.count = 0
-        size = shutil.get_terminal_size((80, 24))
-        self._max_rows = max(size.lines - 5, 5)
-        self._recent = deque(maxlen=self._max_rows)
-        self._issues: List[str] = []
-        self._is_tty = sys.stdout.isatty()
-        self._monitor = _KeyPressMonitor()
-        self.stopped = False
-        self.stop_reason: Optional[str] = None
-        self._active = False
-
-    def __enter__(self) -> "ScrapeProgress":
-        self._monitor.__enter__()
-        self._active = True
-        self._redraw()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._monitor.__exit__(exc_type, exc, tb)
-        self._active = False
-
-    def update(self, username: str) -> None:
-        self.count += 1
-        self._recent.append(username)
-        self._redraw()
-
-    def should_stop(self) -> bool:
-        if self.stopped:
-            return True
-        if self._monitor.poll():
-            self.stop("q")
-        return self.stopped
-
-    def stop(self, reason: str = "manual") -> None:
-        self.stopped = True
-        if not self.stop_reason:
-            self.stop_reason = reason
-
-    def record_issue(self, message: str) -> None:
-        message = (message or "").strip()
-        if not message:
-            return
-        if message not in self._issues:
-            self._issues.append(message)
-
-    def summarize(self) -> None:
-        if self._is_tty:
-            self._clear_screen()
-        print(f"Total encontrados: {self.count}")
-        if self.stopped:
-            if self.stop_reason == "q":
-                print("Proceso detenido manualmente (Q).")
-            elif self.stop_reason == "ctrl_c":
-                print("Proceso interrumpido con Ctrl+C.")
-            else:
-                print("Proceso detenido manualmente.")
-        else:
-            print("Proceso de scraping finalizado.")
-        if self._issues:
-            print("\nAvisos durante el scraping:")
-            for issue in self._issues[:5]:
-                print(f" - {issue}")
-            if len(self._issues) > 5:
-                print(f" - ... {len(self._issues) - 5} eventos adicionales omitidos.")
-        print("")
-
-    def _redraw(self) -> None:
-        if not self._active:
-            return
-        if self._is_tty:
-            self._clear_screen()
-            header = [
-                "Scraping en curso... Presioná Q para detener.",
-                f"Total encontrados: {self.count}",
-                "",
-            ]
-            print("\n".join(header))
-            for name in self._recent:
-                print(f"Perfil encontrado: @{name}")
-            sys.stdout.flush()
-        else:
-            if self._recent:
-                print(f"Total encontrados: {self.count} → @{self._recent[-1]}")
-            else:
-                print(f"Total encontrados: {self.count}")
-
-    def _clear_screen(self) -> None:
-        if not self._is_tty:
-            return
-        try:
-            if os.name == "nt":
-                os.system("cls")
-            else:
-                print("\033c", end="", flush=True)
-        except Exception:
-            print("\033[2J\033[H", end="", flush=True)
-
-
-class _KeyPressMonitor:
-    def __init__(self) -> None:
-        self._using_windows = os.name == "nt"
-        self._isatty = sys.stdin.isatty()
-        self._fd = None
-        self._old_settings = None
-        self._msvcrt = None
-
-    def __enter__(self) -> "_KeyPressMonitor":
-        if self._using_windows:
-            try:
-                import msvcrt  # type: ignore
-
-                self._msvcrt = msvcrt
-            except ImportError:
-                self._using_windows = False
-        if not self._using_windows and self._isatty:
-            import termios
-            import tty
-
-            self._fd = sys.stdin.fileno()
-            self._old_settings = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._using_windows:
-            return
-        if self._fd is not None and self._old_settings is not None:
-            import termios
-
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
-
-    def poll(self) -> bool:
-        if self._using_windows and self._msvcrt is not None:
-            try:
-                while self._msvcrt.kbhit():
-                    key = self._msvcrt.getch()
-                    if key in (b"q", b"Q"):
-                        return True
-            except Exception:
-                return False
-            return False
-        if not self._isatty or self._fd is None:
-            return False
-        import select
-
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
-        if ready:
-            try:
-                key = sys.stdin.read(1)
-            except Exception:
-                return False
-            return key.lower() == "q"
-        return False
-
-
-def _scrape_hashtag(
-    client,
-    username: str,
-    hashtag: str,
-    filters: ScrapeFilters,
-    progress: "ScrapeProgress",
-) -> List[ScrapedUser]:
-    amount = min(max(filters.max_results * 12, filters.max_results + 80), 6000)
-    medias = _collect_hashtag_medias(client, username, hashtag, amount, progress)
-    if not medias:
-        warn(f"No se encontraron publicaciones recientes con #{hashtag}.")
-        return []
-    seen: set[int] = set()
-    cache: Dict[int, object] = {}
-    collected: List[ScrapedUser] = []
-    delay = DelayController(filters.delay)
-    try:
-        for media in medias:
-            user_id, candidate = _resolve_media_user(media)
-            if not user_id or user_id in seen:
-                continue
-            seen.add(user_id)
-            if progress.should_stop():
-                break
-            info = _fetch_user_info(client, user_id, cache, progress, candidate)
-            if not info or not getattr(info, "username", None):
-                continue
-            if _passes_filters(info, filters):
-                collected.append(_build_scraped_user(info))
-                progress.update(info.username)
-                if len(collected) >= filters.max_results:
-                    break
-                delay.pause()
-    except KeyboardInterrupt:
-        progress.stop("ctrl_c")
-    return _dedupe_scraped(collected)
-
-
-def _collect_hashtag_medias(client, username: str, hashtag: str, amount: int, progress: "ScrapeProgress"):
-    medias: List[object] = []
-    seen_media: set[int] = set()
-    fetchers = [
-        ("recientes", getattr(client, "hashtag_medias_recent", None)),
-        ("populares", getattr(client, "hashtag_medias_top", None)),
-        ("v1", getattr(client, "hashtag_medias_v1", None)),
-    ]
-    for label, func in fetchers:
-        if progress.should_stop():
-            break
-        if not callable(func):
-            continue
-        remaining = max(amount - len(medias), 0)
-        if remaining <= 0:
-            break
-        try:
-            chunk = func(hashtag, amount=remaining)
-        except Exception as exc:
-            if "login" in str(exc).lower():
-                mark_connected(username, False)
-                raise
-            progress.record_issue(f"No se pudo obtener datos ({label}) de #{hashtag}: {exc}")
-            continue
-        for media in chunk or []:
-            key = getattr(media, "pk", None) or getattr(media, "id", None)
-            if key is None:
-                continue
-            try:
-                key_int = int(key)
-            except Exception:
-                continue
-            if key_int in seen_media:
-                continue
-            seen_media.add(key_int)
-            medias.append(media)
-            if len(medias) >= amount:
-                break
-    return medias
-
-
-def _scrape_from_profiles(
-    client,
-    username: str,
-    base_profiles: Iterable[str],
-    mode: str,
-    filters: ScrapeFilters,
-    progress: "ScrapeProgress",
-) -> List[ScrapedUser]:
-    collected: List[ScrapedUser] = []
-    seen: set[int] = set()
-    cache: Dict[int, object] = {}
-    delay = DelayController(filters.delay)
-    try:
-        for base in base_profiles:
-            if len(collected) >= filters.max_results:
-                break
-            try:
-                base_id = client.user_id_from_username(base)
-            except Exception as exc:
-                if _looks_like_login_error(exc):
-                    mark_connected(username, False)
-                    raise
-                progress.record_issue(f"No se pudo resolver @{base}: {exc}")
-                continue
-            fetch_amount = min(max(filters.max_results * 4, filters.max_results + 20), 1200)
-            try:
-                if mode == "followers":
-                    candidates = client.user_followers(base_id, amount=fetch_amount)
-                else:
-                    candidates = client.user_following(base_id, amount=fetch_amount)
-            except Exception as exc:
-                if _looks_like_login_error(exc):
-                    mark_connected(username, False)
-                    raise
-                progress.record_issue(f"Error obteniendo datos de @{base}: {exc}")
-                continue
-            items: Iterable[Tuple[int, object]]
-            if isinstance(candidates, dict):
-                items = candidates.items()
-            else:
-                temp_list: List[Tuple[int, object]] = []
-                for cand in candidates or []:
-                    cand_id = getattr(cand, "pk", None)
-                    if cand_id is None:
-                        continue
-                    try:
-                        cand_id_int = int(cand_id)
-                    except Exception:
-                        continue
-                    temp_list.append((cand_id_int, cand))
-                items = temp_list
-            for cand_id, cand in items:
-                if len(collected) >= filters.max_results:
-                    break
-                try:
-                    user_id = int(cand_id)
-                except Exception:
-                    continue
-                if user_id in seen:
-                    continue
-                seen.add(user_id)
-                if progress.should_stop():
-                    break
-                info = _fetch_user_info(client, user_id, cache, progress, cand)
-                if not info or not getattr(info, "username", None):
-                    continue
-                if _passes_filters(info, filters):
-                    collected.append(_build_scraped_user(info))
-                    progress.update(info.username)
-                    if len(collected) >= filters.max_results:
-                        break
-                    delay.pause()
-            if progress.should_stop() or len(collected) >= filters.max_results:
-                break
-    except KeyboardInterrupt:
-        progress.stop("ctrl_c")
-    return _dedupe_scraped(collected)
-
-
-def _fetch_user_info(
-    client,
-    user_id: int,
-    cache: Dict[int, object],
-    progress: Optional["ScrapeProgress"] = None,
-    candidate: Optional[object] = None,
-):
-    if user_id in cache:
-        return cache[user_id]
-
-    username_hint = None
-    if candidate is not None:
-        username_hint = getattr(candidate, "username", None) or ""
-        if not username_hint and isinstance(candidate, dict):
-            username_hint = candidate.get("username")
-        if username_hint:
-            username_hint = str(username_hint).strip().lstrip("@")
-
-    attempts = []
-
-    def _add_attempt(label: str, func) -> None:
-        if not callable(func):
-            return
-        attempts.append((label, func))
-
-    _add_attempt("user_info", lambda: client.user_info(user_id))
-    if hasattr(client, "user_info_gql"):
-        _add_attempt("user_info_gql", lambda: client.user_info_gql(str(user_id)))
-    if username_hint:
-        by_username = getattr(client, "user_info_by_username", None)
-        if callable(by_username):
-            _add_attempt("user_info_by_username", lambda: by_username(username_hint))
-        by_username_v1 = getattr(client, "user_info_by_username_v1", None)
-        if callable(by_username_v1):
-            _add_attempt("user_info_by_username_v1", lambda: by_username_v1(username_hint))
-
-    errors: List[str] = []
-    for label, func in attempts:
-        try:
-            info = func()
-        except Exception as exc:
-            if _looks_like_login_error(exc):
-                raise
-            errors.append(f"{label}: {exc}")
-            continue
-        if info:
-            cache[user_id] = info
-            return info
-
-    if progress and errors:
-        progress.record_issue(
-            "No se pudo obtener info del usuario "
-            f"{user_id}: "
-            + "; ".join(errors[:2])
-            + ("; ..." if len(errors) > 2 else "")
-        )
-    elif errors:
-        warn(
-            "No se pudo obtener info del usuario "
-            f"{user_id}: "
-            + "; ".join(errors[:2])
-            + ("; ..." if len(errors) > 2 else "")
-        )
-    return None
-
-
-def _passes_filters(user_info, filters: ScrapeFilters) -> bool:
-    is_private = bool(getattr(user_info, "is_private", False))
-    if filters.privacy == "public" and is_private:
-        return False
-    if filters.privacy == "private" and not is_private:
-        return False
-
-    follower_count = int(getattr(user_info, "follower_count", 0) or 0)
-    if filters.min_followers and follower_count < filters.min_followers:
-        return False
-    if filters.max_followers and follower_count > filters.max_followers:
-        return False
-
-    media_count = int(getattr(user_info, "media_count", 0) or 0)
-    if filters.min_posts and media_count < filters.min_posts:
-        return False
-    if filters.max_posts and media_count > filters.max_posts:
-        return False
-
-    return True
-
-
-def _handle_scrape_results(users: List[ScrapedUser]) -> None:
-    users = [u for u in users if u and getattr(u, "username", None)]
-    users = _dedupe_scraped(users)
-    if not users:
-        warn("No se encontraron usuarios que cumplan los filtros.")
-        press_enter()
-        return
-    current = users
-    while True:
-        if not current:
-            warn("No quedan usuarios en la lista actual.")
-            break
-        print("\nUsuarios encontrados:")
-        for idx, user in enumerate(current[:20], start=1):
-            resume = (user.biography or user.full_name or "").strip()
-            extra = f" — {resume[:70]}" if resume else ""
-            print(f" {idx:02d}. @{user.username}{extra}")
-        if len(current) > 20:
-            print(f" ... (+{len(current) - 20} más)")
-
-        print("\n¿Qué deseás hacer con la lista?")
-        print("1) Agregar a una lista existente")
-        print("2) Crear una lista nueva")
-        print("3) Aplicar limpieza avanzada")
-        print("4) Cancelar y descartar")
-        choice = ask("Opción: ").strip() or "4"
-        usernames = [u.username.lstrip("@") for u in current]
-        if choice == "1":
-            files = list_files()
-            if not files:
-                warn("No hay listas existentes. Creá una nueva.")
-                continue
-            print("Listas disponibles: " + ", ".join(files))
-            name = ask("Nombre de la lista destino: ").strip()
-            if not name:
-                warn("Debés indicar un nombre.")
-                continue
-            existing = load_list(name)
-            existing_lower = {u.lower() for u in existing}
-            new_entries = [u for u in usernames if u.lower() not in existing_lower]
-            if not new_entries:
-                warn("Todos los usuarios ya estaban presentes en esa lista.")
-                continue
-            append_list(name, new_entries)
-            ok(f"Se agregaron {len(new_entries)} usuarios a {name}.")
-            break
-        elif choice == "2":
-            name = ask("Nombre de la nueva lista: ").strip() or "scrape"
-            save_list(name, usernames)
-            ok(f"Lista {name} creada con {len(usernames)} usuarios.")
-            break
-        elif choice == "3":
-            filtered = _advanced_cleanup_menu(current)
-            if filtered is current:
-                continue
-            current = _dedupe_scraped(filtered)
-        elif choice == "4":
-            warn("Lista descartada.")
-            break
-        else:
-            warn("Opción inválida.")
-    press_enter()
-
-
-def _advanced_cleanup_menu(users: List[ScrapedUser]) -> List[ScrapedUser]:
-    if not users:
-        warn("No hay usuarios para filtrar.")
-        return users
-    while True:
-        print("\nOpciones de limpieza avanzada:")
-        print("1) Filtrar por palabras clave manuales")
-        print("2) Filtrar usando un prompt en lenguaje natural")
-        print("3) Volver sin cambios")
-        choice = ask("Opción: ").strip() or "3"
-        if choice == "1":
-            return _apply_advanced_filter(users)
-        if choice == "2":
-            return _apply_prompt_filter(users)
-        if choice == "3":
-            return users
-        warn("Opción inválida.")
-
-
-def _dedupe_preserve_order(usernames: Iterable[str]) -> List[str]:
-    seen: set[str] = set()
-    ordered: List[str] = []
-    for username in usernames:
-        key = username.strip().lstrip("@").lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        ordered.append(username.strip().lstrip("@"))
-    return ordered
-
-
-def _dedupe_scraped(users: Iterable[ScrapedUser]) -> List[ScrapedUser]:
-    seen: set[str] = set()
-    ordered: List[ScrapedUser] = []
-    for user in users:
-        username = getattr(user, "username", "")
-        key = username.strip().lstrip("@").lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        ordered.append(user)
-    return ordered
-
-
 def _resolve_media_user(media) -> Tuple[Optional[int], Optional[object]]:
     if media is None:
         return None, None
@@ -1144,136 +397,6 @@ def _resolve_media_user(media) -> Tuple[Optional[int], Optional[object]]:
     return None, None
 
 
-def _apply_prompt_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
-    if not users:
-        warn("No hay usuarios para filtrar.")
-        return users
-    print(
-        "\nEscribí un prompt describiendo los perfiles que buscás. "
-        "El sistema analizará bios, nombres y usuarios para encontrar coincidencias."
-    )
-    prompt_text = ask_multiline("Prompt: ").strip()
-    if not prompt_text:
-        warn("No se ingresó un prompt. Se mantiene la lista actual.")
-        return users
-    criteria = _interpret_prompt(prompt_text)
-    if not criteria.has_conditions():
-        warn(
-            "No se identificaron condiciones claras en el prompt. "
-            "Probá con una descripción más específica."
-        )
-        return users
-    matched: List[ScrapedUser] = []
-    for user in users:
-        if _matches_prompt(user, criteria):
-            matched.append(user)
-    if not matched:
-        warn("Ningún perfil coincide con el prompt. Se mantiene la lista actual.")
-        return users
-    print("\nCriterios interpretados:")
-    if criteria.min_followers:
-        print(f" - Seguidores mínimos: {criteria.min_followers}")
-    if criteria.max_followers:
-        print(f" - Seguidores máximos: {criteria.max_followers}")
-    if criteria.min_posts:
-        print(f" - Posteos mínimos: {criteria.min_posts}")
-    if criteria.max_posts:
-        print(f" - Posteos máximos: {criteria.max_posts}")
-    if criteria.include_groups:
-        for idx, group in enumerate(criteria.include_groups, start=1):
-            readable = ", ".join(sorted(group))
-            print(f" - Condición {idx}: {readable}")
-    if criteria.exclude_terms:
-        print(f" - Excluir si contiene: {', '.join(sorted(criteria.exclude_terms))}")
-    print(
-        f"\nPerfiles coincidentes con el prompt: {len(matched)} "
-        f"(de {len(users)})."
-    )
-    preview = matched[:10]
-    if preview:
-        print("Ejemplos:")
-        for idx, user in enumerate(preview, start=1):
-            snippet = (user.biography or user.full_name or "").strip()
-            extra = f" — {snippet[:60]}" if snippet else ""
-            print(f" {idx:02d}. @{user.username}{extra}")
-    confirm = ask(
-        "¿Reemplazar la lista actual con los perfiles encontrados por el prompt? (s/N): "
-    ).strip().lower()
-    if confirm != "s":
-        warn("Se mantiene la lista sin cambios.")
-        return users
-    return matched
-
-
-def _apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
-    if not users:
-        warn("No hay usuarios para filtrar.")
-        return users
-    print(
-        "\nIngresá palabras o frases clave a buscar en la bio, nombre o usuario. "
-        "Separalas con comas o saltos de línea."
-    )
-    print("Podés anteponer '-' para excluir términos específicos.")
-    raw = ask_multiline("Condiciones: ").strip()
-    if not raw:
-        warn("No se ingresaron filtros. Se mantiene la lista actual.")
-        return users
-    tokens = [chunk.strip() for chunk in raw.replace("\n", ",").split(",")]
-    includes = [t.lstrip("+").lower() for t in tokens if t and not t.startswith("-")]
-    excludes = [t[1:].lower() for t in tokens if t.startswith("-") and len(t) > 1]
-    includes = [t for t in includes if t]
-    excludes = [t for t in excludes if t]
-    if not includes and not excludes:
-        warn("No se ingresaron filtros válidos. Se mantiene la lista actual.")
-        return users
-    mode = (
-        ask(
-            "¿Las palabras obligatorias deben aparecer todas (T) o al menos una (A)? (A/T): "
-        )
-        .strip()
-        .lower()
-    )
-    require_all = mode == "t"
-    filtered: List[ScrapedUser] = []
-    for user in users:
-        haystack = " ".join(
-            filter(
-                None,
-                [
-                    getattr(user, "username", "") or "",
-                    getattr(user, "full_name", "") or "",
-                    getattr(user, "biography", "") or "",
-                ],
-            )
-        ).lower()
-        if includes:
-            if require_all:
-                if not all(term in haystack for term in includes):
-                    continue
-            else:
-                if not any(term in haystack for term in includes):
-                    continue
-        if excludes and any(term in haystack for term in excludes):
-            continue
-        filtered.append(user)
-    if not filtered:
-        warn(
-            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista actual."
-        )
-        return users
-    print(f"\nPerfiles tras el filtrado avanzado: {len(filtered)} (de {len(users)}).")
-    preview = filtered[:10]
-    if preview:
-        print("Ejemplos filtrados:")
-        for idx, user in enumerate(preview, start=1):
-            snippet = (user.biography or user.full_name or "").strip()
-            extra = f" — {snippet[:60]}" if snippet else ""
-            print(f" {idx:02d}. @{user.username}{extra}")
-    confirm = ask("¿Aplicar este filtrado a la lista actual? (s/N): ").strip().lower()
-    if confirm != "s":
-        warn("Se mantiene la lista sin cambios.")
-        return users
-    return filtered
 
 
 _PROMPT_STOPWORDS = {
@@ -1687,37 +810,6 @@ def _term_in_haystack(term: str, haystack: str) -> bool:
     return bool(re.search(pattern, haystack))
 
 
-def _matches_prompt(user: ScrapedUser, criteria: PromptCriteria) -> bool:
-    haystack_parts = [
-        getattr(user, "username", "") or "",
-        getattr(user, "full_name", "") or "",
-        getattr(user, "biography", "") or "",
-    ]
-    combined = " ".join(part for part in haystack_parts if part).strip()
-    normalized_haystack = _normalize_text(combined)
-    padded = f" {normalized_haystack} " if normalized_haystack else ""
-    if criteria.exclude_terms and padded:
-        for term in criteria.exclude_terms:
-            if _term_in_haystack(term, padded):
-                return False
-    follower_count = int(getattr(user, "follower_count", 0) or 0)
-    if criteria.min_followers and follower_count < criteria.min_followers:
-        return False
-    if criteria.max_followers and follower_count > criteria.max_followers:
-        return False
-    media_count = int(getattr(user, "media_count", 0) or 0)
-    if criteria.min_posts and media_count < criteria.min_posts:
-        return False
-    if criteria.max_posts and media_count > criteria.max_posts:
-        return False
-    if criteria.include_groups:
-        for group in criteria.include_groups:
-            if not any(_term_in_haystack(term, padded) for term in group):
-                return False
-    elif criteria.optional_terms:
-        if not any(_term_in_haystack(term, padded) for term in criteria.optional_terms):
-            return False
-    return True
 
 
 def _extract_user_id(user) -> Optional[int]:
@@ -1743,18 +835,730 @@ def _format_user(user_info, position: int, limit: int) -> str:
     )
 
 
-def _build_scraped_user(info) -> ScrapedUser:
-    biography = (getattr(info, "biography", "") or "").strip()
-    full_name = (getattr(info, "full_name", "") or "").strip()
-    follower_count = int(getattr(info, "follower_count", 0) or 0)
-    media_count = int(getattr(info, "media_count", 0) or 0)
-    is_private = bool(getattr(info, "is_private", False))
-    username = getattr(info, "username", "").strip()
-    return ScrapedUser(
-        username=username.lstrip("@"),
-        biography=biography,
-        full_name=full_name,
-        follower_count=follower_count,
-        media_count=media_count,
-        is_private=is_private,
+
+
+class PlaywrightProfileScraper:
+    def __init__(self, page: Any):
+        self.page = page
+
+    def scrape_profile(self, username: str) -> Optional[Dict[str, Any]]:
+        if not self.page:
+            return None
+
+        url = f"https://www.instagram.com/{username}/"
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                self.page.wait_for_selector("header", timeout=10000)
+            except:
+                # If header doesn't appear, maybe account not found or challenge
+                if "login" in self.page.url:
+                    raise RuntimeError("Sesión perdida (login detectado)")
+                return None
+
+            time.sleep(1.5)
+
+            full_name = ""
+            bio = ""
+            followers = 0
+            posts = 0
+            is_private = False
+            profile_pic_url = ""
+            external_url = ""
+
+            # Privacy
+            is_private = self.page.locator("svg[aria-label='Esta cuenta es privada'], svg[aria-label='Private']").count() > 0
+
+            header = self.page.locator("header")
+
+            # Stats
+            stats = header.locator("ul li")
+            for i in range(stats.count()):
+                try:
+                    text = stats.nth(i).inner_text().lower()
+                    if "seguidor" in text or "follower" in text:
+                        followers = self._parse_count(text)
+                    elif "publicaci" in text or "post" in text:
+                        posts = self._parse_count(text)
+                except:
+                    continue
+
+            # Bio area
+            try:
+                bio_elements = header.locator("div[dir='auto']")
+                if bio_elements.count() > 0:
+                    bio = "\n".join(bio_elements.all_inner_texts())
+
+                name_el = header.locator("h1, h2").first
+                if name_el.count() > 0:
+                    full_name = name_el.inner_text()
+            except:
+                pass
+
+            # Link
+            try:
+                link_el = header.locator("a[target='_blank']").first
+                if link_el.count() > 0:
+                    external_url = link_el.get_attribute("href") or ""
+            except:
+                pass
+
+            # Profile Pic
+            try:
+                img_el = header.locator("img").first
+                if img_el.count() > 0:
+                    profile_pic_url = img_el.get_attribute("src") or ""
+            except:
+                pass
+
+            return {
+                "username": username,
+                "full_name": full_name,
+                "biography": bio,
+                "follower_count": followers,
+                "media_count": posts,
+                "is_private": is_private,
+                "external_url": external_url,
+                "profile_pic_url": profile_pic_url
+            }
+        except Exception as e:
+            logging.error(f"Error scraping profile {username}: {e}")
+            if "Sesión perdida" in str(e):
+                raise
+            return None
+
+    def _parse_count(self, text: str) -> int:
+        try:
+            raw = text.split()[0].lower().replace(".", "").replace(",", "")
+            if "k" in raw:
+                return int(float(raw.replace("k", "")) * 1000)
+            if "m" in raw:
+                return int(float(raw.replace("m", "")) * 1000000)
+            return int(re.sub(r"[^0-9]", "", raw))
+        except:
+            return 0
+
+
+def _passes_classic_filters(data: Dict[str, Any], config: LeadFilterConfig) -> bool:
+    if config.min_followers and data["follower_count"] < config.min_followers:
+        return False
+    if config.max_followers and data["follower_count"] > 0 and data["follower_count"] > config.max_followers:
+        return False
+    if config.min_posts and data["media_count"] < config.min_posts:
+        return False
+    if config.max_posts and data["media_count"] > 0 and data["media_count"] > config.max_posts:
+        return False
+    if config.privacy == "public" and data["is_private"]:
+        return False
+    if config.privacy == "private" and not data["is_private"]:
+        return False
+    if config.has_link_in_bio and not data["external_url"]:
+        return False
+    if config.keywords:
+        haystack = f"{data['username']} {data['full_name']} {data['biography']}".lower()
+        if not any(k.lower() in haystack for k in config.keywords):
+            return False
+    return True
+
+
+def _download_profile_pic(url: str, username: str) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        import requests
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            temp_dir = Path("storage/temp_pics")
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            file_path = temp_dir / f"{username}.jpg"
+            file_path.write_bytes(resp.content)
+            return str(file_path)
+    except Exception as e:
+        logging.error(f"Error downloading profile pic for {username}: {e}")
+    return None
+
+
+_CLIP_MODEL = None
+_CLIP_PREPROCESS = None
+
+def _clip_filter(image_path: str, prompt: str) -> bool:
+    global _CLIP_MODEL, _CLIP_PREPROCESS
+    if not prompt:
+        return True
+    try:
+        import torch
+        import clip
+        from PIL import Image
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if _CLIP_MODEL is None:
+            _CLIP_MODEL, _CLIP_PREPROCESS = clip.load("ViT-B/32", device=device)
+
+        image = _CLIP_PREPROCESS(Image.open(image_path)).unsqueeze(0).to(device)
+        text = clip.tokenize([prompt, "un perfil de instagram irrelevante"]).to(device)
+
+        with torch.no_grad():
+            logits_per_image, _ = _CLIP_MODEL(image, text)
+            probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+
+        # Si la probabilidad de que coincida con el prompt es mayor a la del fallback
+        return probs[0][0] > 0.6 # Un poco más estricto
+    except ImportError:
+        logging.warning("Bibliotecas CLIP/torch no encontradas. Saltando filtrado de imagen.")
+        return True
+    except Exception as e:
+        logging.error(f"Error en el filtro CLIP: {e}")
+        return False
+
+
+def _deepface_filter(image_path: str, target_sex: str, min_age: int = 0, max_age: int = 0) -> bool:
+    if target_sex == "indifferent" and not min_age and not max_age:
+        return True
+    try:
+        from deepface import DeepFace
+
+        results = DeepFace.analyze(img_path=image_path, actions=['gender', 'age'], enforce_detection=False)
+        if not results:
+            return False
+
+        res = results[0]
+
+        # Sex filter
+        if target_sex != "indifferent":
+            dominant_gender = res.get("dominant_gender", "").lower()
+            # DeepFace usa 'Man' y 'Woman'
+            if target_sex == "male" and dominant_gender != "man":
+                return False
+            if target_sex == "female" and dominant_gender != "woman":
+                return False
+
+        # Age filter
+        if min_age or max_age:
+            age = res.get("age", 0)
+            if min_age and age < min_age:
+                return False
+            if max_age and age > max_age:
+                return False
+
+        return True
+    except ImportError:
+        logging.warning("Biblioteca DeepFace no encontrada. Saltando filtrado por sexo/edad.")
+        return True
+    except Exception as e:
+        logging.error(f"Error en el filtro DeepFace: {e}")
+        return False
+
+
+def _passes_sex_filter(image_path: Optional[str], target_sex: str) -> bool:
+    if target_sex == "indifferent":
+        return True
+    if not image_path:
+        # Si no hay foto y se pidió sexo específico, se descarta (Etapa 3 requiere foto)
+        return False
+    return _deepface_filter(image_path, target_sex)
+
+
+def _llm_classify(data: Dict[str, Any], criterion: str) -> bool:
+    if not criterion:
+        return True
+
+    prompt = f"""Analiza el siguiente perfil de Instagram y determina si califica según el criterio dado.
+
+Perfil:
+Username: {data['username']}
+Nombre: {data['full_name']}
+Bio: {data['biography']}
+
+Criterio del usuario: {criterion}
+
+Responde ÚNICAMENTE con una de estas dos palabras:
+CALIFICA
+o
+NO CALIFICA
+
+Si hay duda o ambigüedad, responde NO CALIFICA. No expliques nada."""
+
+    try:
+        import requests
+        # Intentar conectar con Ollama local (puerto por defecto 11434)
+        url = "http://localhost:11434/api/generate"
+        # Usamos qwen como modelo por defecto solicitado
+        payload = {
+            "model": "qwen",
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.0 # Queremos determinismo máximo
+            }
+        }
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code == 200:
+            response_text = resp.json().get("response", "").strip().upper()
+            if "CALIFICA" in response_text and "NO CALIFICA" not in response_text:
+                return True
+            return False
+        else:
+            logging.error(f"Error de conexión con Ollama (Status {resp.status_code}).")
+            return False
+    except Exception as e:
+        logging.error(f"Error en Stage 2 (LLM): {e}")
+        return False
+
+
+def _lead_filters_menu():
+    while True:
+        banner()
+        title("Configuración de Filtros de Leads")
+        filters = load_lead_filters()
+        print(f"Filtros guardados: {len(filters)}")
+        for i, f in enumerate(filters, 1):
+            print(f" {i}) {f.name}")
+
+        print("\n1) Crear nuevo filtro (reemplaza anteriores)")
+        print("2) Modificar filtro existente")
+        print("3) Eliminar todos los filtros")
+        print("4) Volver")
+
+        op = ask("Opción: ").strip()
+        if op == "1":
+            name = ask("Nombre del filtro: ").strip() or "default"
+            new_f = _prompt_lead_filter_config(name)
+            save_lead_filters([new_f])
+            ok("Filtro creado.")
+            press_enter()
+        elif op == "2":
+            if not filters:
+                warn("No hay filtros para modificar.")
+                press_enter()
+                continue
+            idx = ask_int("Selecciona número de filtro: ", min_value=1, max_value=len(filters))
+            if idx:
+                current = filters[idx - 1]
+                updated = _prompt_lead_filter_config(current.name, current)
+                filters[idx - 1] = updated
+                save_lead_filters(filters)
+                ok("Filtro actualizado.")
+            press_enter()
+        elif op == "3":
+            if ask("¿Eliminar todos los filtros? (s/N): ").lower() == "s":
+                save_lead_filters([])
+                ok("Filtros eliminados.")
+            press_enter()
+        elif op == "4":
+            break
+
+
+def _prompt_lead_filter_config(name: str, existing: Optional[LeadFilterConfig] = None) -> LeadFilterConfig:
+    print(f"\nConfigurando filtro: {name}")
+
+    def _val(attr, default):
+        return getattr(existing, attr) if existing else default
+
+    # Stage 1
+    min_f = ask_int(f"Mínimo seguidores [{_val('min_followers', 0)}]: ", min_value=0, default=_val("min_followers", 0))
+    max_f = ask_int(f"Máximo seguidores [{_val('max_followers', 0)}]: ", min_value=0, default=_val("max_followers", 0))
+    min_p = ask_int(f"Mínimo posts [{_val('min_posts', 0)}]: ", min_value=0, default=_val("min_posts", 0))
+    max_p = ask_int(f"Máximo posts [{_val('max_posts', 0)}]: ", min_value=0, default=_val("max_posts", 0))
+
+    print("Privacidad: 1) Públicas, 2) Privadas, 3) Ambas")
+    p_choice = ask(f"Opción [{_val('privacy', 'any')}]: ").strip()
+    privacy = "any"
+    if p_choice == "1":
+        privacy = "public"
+    elif p_choice == "2":
+        privacy = "private"
+    elif not p_choice and existing:
+        privacy = existing.privacy
+
+    has_link = ask(f"¿Requiere link en bio? (s/N) [{_val('has_link_in_bio', False)}]: ").lower() == "s"
+
+    kw_raw = ask(f"Palabras clave (separadas por coma) [{', '.join(_val('keywords', []))}]: ").strip()
+    keywords = [k.strip() for k in kw_raw.split(",")] if kw_raw else _val("keywords", [])
+
+    # Stage 2
+    llm_criterion = ask(f"Criterio para IA (ej: 'fitness coaches') [{_val('llm_criterion', '')}]: ").strip() or _val("llm_criterion", "")
+
+    # Stage 3
+    pic_prompt = ask(f"Prompt para foto (CLIP) [{_val('profile_pic_prompt', '')}]: ").strip() or _val("profile_pic_prompt", "")
+
+    print("Sexo objetivo: 1) Hombre, 2) Mujer, 3) Indiferente")
+    s_choice = ask(f"Opción [{_val('target_sex', 'indifferent')}]: ").strip()
+    target_sex = "indifferent"
+    if s_choice == "1":
+        target_sex = "male"
+    elif s_choice == "2":
+        target_sex = "female"
+    elif not s_choice and existing:
+        target_sex = existing.target_sex
+
+    min_age = ask_int(f"Edad mínima [{_val('min_age', 0)}]: ", min_value=0, default=_val("min_age", 0))
+    max_age = ask_int(f"Edad máxima [{_val('max_age', 0)}]: ", min_value=0, default=_val("max_age", 0))
+
+    return LeadFilterConfig(
+        name=name,
+        min_followers=min_f,
+        max_followers=max_f,
+        min_posts=min_p,
+        max_posts=max_p,
+        privacy=privacy,
+        has_link_in_bio=has_link,
+        keywords=keywords,
+        llm_criterion=llm_criterion,
+        profile_pic_prompt=pic_prompt,
+        target_sex=target_sex,
+        min_age=min_age,
+        max_age=max_age
     )
+
+
+def _lead_filtering_main_menu():
+    while True:
+        banner()
+        title("Motor de Filtrado de Leads")
+        print("1) Iniciar nuevo filtrado")
+        print("2) Configurar filtros")
+        print("3) Reanudar sesión pendiente")
+        print("4) Ver historial de sesiones")
+        print("5) Volver")
+
+        op = ask("Opción: ").strip()
+        if op == "1":
+            _lead_filtering_wizard()
+        elif op == "2":
+            _lead_filters_menu()
+        elif op == "3":
+            _resume_filtering_session()
+        elif op == "4":
+            sessions = load_filtering_sessions()
+            if not sessions:
+                warn("No hay sesiones guardadas.")
+            else:
+                print(f"{'ID':<20} | {'Filtro':<15} | {'Progreso':<10} | {'Status'}")
+                print("-" * 60)
+                for sid, s in list(sessions.items())[-15:]:
+                    print(f"{sid:<20} | {s.get('filter_name', 'N/A'):<15} | {s.get('leads_processed')}/{s.get('leads_total'):<10} | {s.get('status')}")
+            press_enter()
+        elif op == "5":
+            break
+
+
+def _resume_filtering_session():
+    sessions = load_filtering_sessions()
+    pending = {sid: s for sid, s in sessions.items() if s.get("status") == "paused" or (s.get("status") == "running" and s.get("leads_pending"))}
+
+    if not pending:
+        warn("No hay sesiones pendientes para reanudar.")
+        press_enter()
+        return
+
+    print("\nSeleccioná sesión para reanudar:")
+    sids = list(pending.keys())
+    for i, sid in enumerate(sids, 1):
+        s = pending[sid]
+        print(f" {i}) {sid} ({s.get('filter_name')}) - Pendientes: {len(s.get('leads_pending', []))}")
+
+    idx = ask_int("Sesión: ", min_value=1, max_value=len(sids))
+    if idx is None:
+        return
+
+    session_id = sids[idx - 1]
+    session_data = pending[session_id]
+    session = LeadFilteringSession(**session_data)
+
+    filters = load_lead_filters()
+    config = next((f for f in filters if f.name == session.filter_name), None)
+    if not config:
+        warn(f"El filtro '{session.filter_name}' ya no existe. No se puede reanudar.")
+        press_enter()
+        return
+
+    try:
+        all_accts = list_all()
+    except:
+        all_accts = []
+
+    if not all_accts:
+        warn("No hay cuentas configuradas.")
+        press_enter()
+        return
+
+    print(f"\nReanudando con {len(session.leads_pending)} leads pendientes.")
+    print("Seleccioná cuentas para continuar:")
+    print("1) Usar todas las cuentas")
+    print("2) Seleccionar manualmente")
+    c = ask("Opción [1]: ").strip() or "1"
+    selected = all_accts if c == "1" else []
+    if c == "2":
+        for i, a in enumerate(all_accts, 1): print(f" {i}) @{a.get('username')}")
+        idxs_raw = ask("Cuentas (separadas por coma): ").strip()
+        if idxs_raw:
+            for i in idxs_raw.split(","):
+                try: selected.append(all_accts[int(i.strip()) - 1])
+                except: pass
+
+    if not selected:
+        warn("No se seleccionaron cuentas.")
+        return
+
+    concurrency = ask_int("Concurrencia: ", min_value=1, default=1)
+    session.status = "running"
+    save_filtering_session(session)
+
+    _run_filtering_engine(selected, session.leads_pending, config, session, concurrency, 10, 30)
+
+
+def _lead_filtering_wizard():
+    # 1. Seleccionar Filtro
+    filters = load_lead_filters()
+    if not filters:
+        warn("No hay filtros configurados. Creá uno primero en el menú de configuración.")
+        press_enter()
+        return
+
+    print("\nSeleccioná un filtro:")
+    for i, f in enumerate(filters, 1):
+        print(f" {i}) {f.name}")
+    f_idx = ask_int("Filtro: ", min_value=1, max_value=len(filters))
+    if f_idx is None:
+        return
+    config = filters[f_idx - 1]
+
+    # 2. Cargar Leads
+    usernames = _load_usernames_from_source()
+    if not usernames:
+        warn("No se cargaron usernames.")
+        press_enter()
+        return
+
+    # 3. Seleccionar Cuentas
+    try:
+        all_accts = list_all()
+    except:
+        all_accts = []
+
+    if not all_accts:
+        warn("No hay cuentas configuradas.")
+        press_enter()
+        return
+
+    print(f"\nCuentas disponibles: {len(all_accts)}")
+    print("1) Seleccionar por alias")
+    print("2) Usar todas las cuentas")
+    print("3) Seleccionar manualmente")
+    acct_choice = ask("Opción: ").strip()
+
+    selected_accts = []
+    if acct_choice == "1":
+        alias = ask("Alias: ").strip()
+        selected_accts = [a for a in all_accts if a.get("alias") == alias]
+    elif acct_choice == "2":
+        selected_accts = all_accts
+    elif acct_choice == "3":
+        for i, a in enumerate(all_accts, 1):
+            print(f" {i}) @{a.get('username')}")
+        idxs_raw = ask("Cuentas (ej: 1,3,5): ").strip()
+        if idxs_raw:
+            for idx_s in idxs_raw.split(","):
+                try:
+                    selected_accts.append(all_accts[int(idx_s.strip()) - 1])
+                except:
+                    pass
+
+    if not selected_accts:
+        warn("No se seleccionaron cuentas válidas.")
+        press_enter()
+        return
+
+    # 4. Configuración de ejecución
+    concurrency = ask_int("Concurrencia (hilos/cuentas en paralelo): ", min_value=1, default=1)
+    min_delay = ask_int("Delay mínimo entre perfiles (segundos): ", min_value=0, default=10)
+    max_delay = ask_int("Delay máximo entre perfiles (segundos): ", min_value=0, default=30)
+
+    # 5. Sesión
+    session_id = f"filt_{int(time.time())}"
+    session = LeadFilteringSession(
+        id=session_id,
+        filter_name=config.name,
+        leads_total=len(usernames),
+        leads_processed=0,
+        leads_qualified=[],
+        leads_disqualified=[],
+        leads_pending=usernames.copy()
+    )
+    save_filtering_session(session)
+
+    ok(f"Iniciando filtrado de {len(usernames)} leads...")
+    _run_filtering_engine(selected_accts, usernames, config, session, concurrency, min_delay, max_delay)
+
+
+def _run_filtering_engine(accounts: List[Dict], usernames: List[str], config: LeadFilterConfig, session: LeadFilteringSession, concurrency: int, min_delay: int, max_delay: int):
+    lead_queue = queue.Queue()
+    for u in usernames:
+        lead_queue.put(u)
+
+    results_lock = threading.Lock()
+
+    def worker(account):
+        from src.dm_playwright_client import PlaywrightDMClient
+        client = None
+        try:
+            client = PlaywrightDMClient(account=account, headless=True)
+            client.ensure_ready()
+            scraper = PlaywrightProfileScraper(client._page)
+
+            while not lead_queue.empty():
+                try:
+                    username = lead_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                with results_lock:
+                    prog = f"[{session.leads_processed + 1}/{session.leads_total}]"
+                print(f"{prog} [Worker @{account['username']}] Analizando @{username}...")
+
+                try:
+                    # Stage 1: Classic
+                    profile_data = scraper.scrape_profile(username)
+                    if not profile_data:
+                        print(f"      @{username} -> ERROR (Scraping)")
+                        with results_lock:
+                            session.leads_disqualified.append(f"{username} (error scraping)")
+                            if username in session.leads_pending: session.leads_pending.remove(username)
+                            session.leads_processed += 1
+                            save_filtering_session(session)
+                        continue
+
+                    if not _passes_classic_filters(profile_data, config):
+                        print(f"      @{username} -> DESCARTADO (Stage 1 - Filtros Duros)")
+                        with results_lock:
+                            session.leads_disqualified.append(f"{username} (stage 1)")
+                            if username in session.leads_pending: session.leads_pending.remove(username)
+                            session.leads_processed += 1
+                            save_filtering_session(session)
+                        continue
+
+                    # Stage 2: LLM
+                    if config.llm_criterion and not _llm_classify(profile_data, config.llm_criterion):
+                        print(f"      @{username} -> DESCARTADO (Stage 2 - IA Texto)")
+                        with results_lock:
+                            session.leads_disqualified.append(f"{username} (stage 2)")
+                            if username in session.leads_pending: session.leads_pending.remove(username)
+                            session.leads_processed += 1
+                            save_filtering_session(session)
+                        continue
+
+                    # Stage 3: Image
+                    pic_path = None
+                    if config.profile_pic_prompt or config.target_sex != "indifferent":
+                        pic_path = _download_profile_pic(profile_data.get("profile_pic_url", ""), username)
+                        if not pic_path:
+                            with results_lock:
+                                session.leads_disqualified.append(f"{username} (no photo)")
+                                session.leads_processed += 1
+                                save_filtering_session(session)
+                            continue
+
+                        # CLIP
+                        if config.profile_pic_prompt and not _clip_filter(pic_path, config.profile_pic_prompt):
+                            print(f"      @{username} -> DESCARTADO (Stage 3 - CLIP Imagen)")
+                            with results_lock:
+                                session.leads_disqualified.append(f"{username} (CLIP)")
+                                if username in session.leads_pending: session.leads_pending.remove(username)
+                                session.leads_processed += 1
+                                save_filtering_session(session)
+                            continue
+
+                        # DeepFace / Sex
+                        if not _passes_sex_filter(pic_path, config.target_sex):
+                            print(f"      @{username} -> DESCARTADO (Stage 3 - Sexo/Edad)")
+                            with results_lock:
+                                session.leads_disqualified.append(f"{username} (sex)")
+                                if username in session.leads_pending: session.leads_pending.remove(username)
+                                session.leads_processed += 1
+                                save_filtering_session(session)
+                            continue
+
+                    # EXIT OK
+                    print(f"      @{username} -> ✅ CALIFICA!")
+                    with results_lock:
+                        session.leads_qualified.append(username)
+                        if username in session.leads_pending: session.leads_pending.remove(username)
+                        session.leads_processed += 1
+                        save_filtering_session(session)
+
+                except Exception as e:
+                    logging.error(f"Error procesando @{username}: {e}")
+                finally:
+                    lead_queue.task_done()
+                    time.sleep(random.randint(min_delay, max_delay))
+
+        except Exception as e:
+            logging.error(f"Error crítico en worker @{account['username']}: {e}")
+        finally:
+            if client:
+                client.close()
+
+    num_workers = min(concurrency, len(accounts))
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            executor.map(worker, accounts[:num_workers])
+    except KeyboardInterrupt:
+        ok("Pausando ejecución...")
+        session.status = "paused"
+        save_filtering_session(session)
+        return
+
+    session.status = "completed"
+    save_filtering_session(session)
+    ok(f"Filtrado completado. Calificaron {len(session.leads_qualified)} leads.")
+    if session.leads_qualified:
+        if ask("¿Guardar calificados en una lista nueva? (s/N): ").lower() == "s":
+            name = ask("Nombre de la lista: ").strip() or f"qualified_{session.id}"
+            save_list(name, session.leads_qualified)
+            ok("Guardado.")
+    press_enter()
+
+
+def _load_usernames_from_source() -> List[str]:
+    print("\nCargar usernames desde:")
+    print("1) Archivo CSV")
+    print("2) Archivo TXT (una lista de leads existente)")
+    print("3) Pegar manualmente")
+    choice = ask("Opción: ").strip()
+
+    if choice == "1":
+        path = ask("Ruta del CSV: ").strip()
+        p = Path(path)
+        if not p.exists():
+            warn("Archivo no encontrado.")
+            return []
+        users = []
+        try:
+            with p.open(newline="", encoding="utf-8") as f:
+                for row in csv.reader(f):
+                    if row:
+                        users.append(row[0].strip().lstrip("@"))
+            return users
+        except Exception as e:
+            warn(f"Error leyendo CSV: {e}")
+            return []
+    elif choice == "2":
+        files = list_files()
+        if not files:
+            warn("No hay listas TXT disponibles.")
+            return []
+        print("Listas: " + ", ".join(files))
+        name = ask("Nombre de la lista: ").strip()
+        return load_list(name)
+    elif choice == "3":
+        print("Pegá usernames (uno por línea). Línea vacía para terminar:")
+        lines = []
+        while True:
+            s = ask("").strip()
+            if not s:
+                break
+            lines.append(s.lstrip("@"))
+        return lines
+    else:
+        warn("Opción inválida.")
+        return []
