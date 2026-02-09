@@ -78,6 +78,7 @@ def categorize_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "role": role,
                 "sent_at": msg.get("first_sent_at"),
                 "next_sent_at": messages_sent_sorted[idx+1].get("first_sent_at") if idx+1 < len(messages_sent_sorted) else None,
+                "next_is_followup": messages_sent_sorted[idx+1].get("is_followup", False) if idx+1 < len(messages_sent_sorted) else False,
                 "thread_data": thread_data
             }
             categorized_messages.append(msg_entry)
@@ -99,7 +100,7 @@ def calculate_hourly_performance(sent_data: List[Tuple[float, bool]]) -> Dict[st
         if 8 <= hour < 12: b = "08-12"
         elif 12 <= hour < 16: b = "12-16"
         elif 16 <= hour < 20: b = "16-20"
-        elif 20 <= hour <= 23 or 0 <= hour < 8: b = "20-00" # Agrupamos noche en el último bucket para seguir el ejemplo
+        elif 20 <= hour <= 23 or 0 <= hour < 8: b = "20-00"
 
         if b:
             buckets[b]["sent"] += 1
@@ -128,27 +129,30 @@ def calculate_metrics(categorized_messages: List[Dict[str, Any]]) -> Dict[str, A
         thread_data = msg["thread_data"]
         sent_at = msg["sent_at"]
         next_sent_at = msg["next_sent_at"]
+        next_is_followup = msg["next_is_followup"]
 
         responded = False
         response_time = None
 
-        all_msgs = thread_data.get("messages", [])
-        if all_msgs:
-            inbound_responses = [m for m in all_msgs if m.get("direction") == "inbound" and m.get("timestamp_epoch", 0) > sent_at]
-            if next_sent_at:
-                inbound_responses = [m for m in inbound_responses if m.get("timestamp_epoch", 0) < next_sent_at]
-
-            if inbound_responses:
-                inbound_responses.sort(key=lambda x: x.get("timestamp_epoch", 0))
-                first_resp = inbound_responses[0]
+        # Estrategia de detección de respuesta mejorada para conversation_engine.json
+        if next_sent_at:
+            # Si hay un mensaje siguiente y NO es un follow-up, es que nos respondió al anterior
+            if not next_is_followup:
                 responded = True
-                response_time = first_resp.get("timestamp_epoch") - sent_at
+                # No podemos saber el tiempo exacto de respuesta porque no tenemos el historial,
+                # pero podemos estimarlo como el tiempo hasta el siguiente mensaje enviado o usar el last_received si cuadra
+                last_received = thread_data.get("last_message_received_at")
+                if last_received and sent_at < last_received < next_sent_at:
+                    response_time = last_received - sent_at
+            else:
+                # Si el siguiente es un follow-up, el actual NO fue respondido (al menos antes del follow-up)
+                responded = False
         else:
+            # Es el último mensaje enviado en el thread
             last_received = thread_data.get("last_message_received_at")
             if last_received and last_received > sent_at:
-                if next_sent_at is None or last_received < next_sent_at:
-                    responded = True
-                    response_time = last_received - sent_at
+                responded = True
+                response_time = last_received - sent_at
 
         raw_stats[role][text]["sent_info"].append((sent_at, responded, response_time))
 
@@ -198,7 +202,7 @@ def calculate_metrics(categorized_messages: List[Dict[str, Any]]) -> Dict[str, A
 def render_main_menu(stats: Dict[str, Any]):
     while True:
         banner()
-        print(style_text("ESTADÍSTICAS Y MÉTRICAS", color=Fore.CYAN, bold=True))
+        print(style_text("ESTADÍSTICAS Y MÉTRICAS v1.1", color=Fore.CYAN, bold=True))
         print(full_line(color=Fore.BLUE))
         print(f"1) {ROLE_LABELS[ROLE_SALUDO]}")
         print(f"2) {ROLE_LABELS[ROLE_PITCH]}")
@@ -252,6 +256,9 @@ def render_message_list(stats: Dict[str, Any], role: str):
         print(style_text(f"DETALLE DE {ROLE_LABELS[role]}", color=Fore.CYAN, bold=True))
         print(full_line(color=Fore.BLUE))
 
+        if not data["messages"]:
+            print("No hay mensajes registrados en esta categoría.")
+
         for idx, msg in enumerate(data["messages"], 1):
             print(f"[{idx}]")
             print(f"Texto:\n\"{msg['text'][:100]}{'...' if len(msg['text']) > 100 else ''}\"")
@@ -267,6 +274,9 @@ def render_message_list(stats: Dict[str, Any], role: str):
 
         choice = ask("Opción: ").strip()
         if choice == "1":
+            if not data["messages"]:
+                warn("No hay mensajes para seleccionar.")
+                continue
             midx = ask_int("Número de mensaje: ", 1, len(data["messages"]))
             if midx:
                 render_individual_message(data["messages"][midx-1], role)
