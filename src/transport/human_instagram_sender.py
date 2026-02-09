@@ -233,46 +233,59 @@ class HumanInstagramSender:
         # Buscamos dentro del diálogo de resultados
         results_container = page.locator("div[role='dialog']")
         if await results_container.count() == 0:
-            results_container = page # Fallback al body si no hay dialog explícito
+            # Fallback a contenedores comunes de búsqueda
+            results_container = page.locator("div[aria-label='Nuevo mensaje'], div[aria-label='New message'], main")
+            if await results_container.count() == 0:
+                results_container = page
 
         # Buscamos todos los elementos que podrían ser una fila de resultado
         # Generalmente son div[role='button'] o li
+        # Limitamos a los primeros 10 resultados para evitar ruido
         rows = results_container.locator("div[role='button'], li")
-        row_count = await rows.count()
+        try:
+            row_count = await rows.count()
+        except Exception:
+            row_count = 0
         
         selection: Optional[Locator] = None
+        logger.debug("Escaneando %d posibles filas de resultados para match exacto con '%s'", row_count, normalized)
 
-        for i in range(row_count):
+        for i in range(min(row_count, 15)):
             row = rows.nth(i)
-            # El username suele estar en un span o div dir="auto"
-            # Intentamos encontrar un descendiente que tenga EXACTAMENTE el texto buscado
-            # También revisamos el alt de la imagen si existe
+            try:
+                if not await row.is_visible():
+                    continue
 
-            # 1. Buscar spans con texto exacto
-            spans = row.locator("span, div").filter(has_text=re.compile(rf"^{re.escape(normalized)}$", re.IGNORECASE))
-            if await spans.count() > 0:
-                # Verificar que el texto sea realmente idéntico (filter puede ser engañoso con sub-elementos)
-                for j in range(await spans.count()):
-                    if (await spans.nth(j).inner_text() or "").strip().lower() == normalized:
-                        selection = row
-                        break
-            
-            if selection: break
+                # El username suele estar en un span o div
+                # Requisito Fase 2: Coincidencia EXACTA (case-insensitive)
 
-            # 2. Buscar en el alt de la imagen de perfil
-            img = row.locator("img")
-            if await img.count() > 0:
-                alt = (await img.first.get_attribute("alt") or "").lower()
-                if normalized in alt and "foto" in alt:
-                    # El alt suele ser "Foto del perfil de <username>"
-                    # Si el username está en el alt, es una buena señal, pero validamos con spans internos si es posible
-                    # Por ahora, si el normalized está en el alt y no hay otros spans, podría valer,
-                    # pero el requerimiento pide selección EXACTA.
-                    # Vamos a ser estrictos y preferir la validación de texto visible.
-                    pass
+                # Obtenemos todos los spans y divs internos que podrían contener el texto
+                candidates = row.locator("span, div")
+                cand_count = await candidates.count()
+
+                for j in range(cand_count):
+                    cand = candidates.nth(j)
+                    # Usamos text_content() para evitar ruidos de sub-elementos si los hay,
+                    # aunque inner_text() suele ser más "lo que ve el usuario".
+                    try:
+                        val = (await cand.text_content() or "").strip().lower()
+                        if val == normalized:
+                            # Encontrado match exacto en un elemento interno
+                            selection = row
+                            logger.info("Match exacto encontrado en elemento %d de la fila %d: '%s'", j, i, val)
+                            break
+                    except Exception:
+                        continue
+
+                if selection:
+                    break
+
+            except Exception as e:
+                logger.debug("Error procesando fila %d: %s", i, e)
+                continue
 
         if selection:
-            logger.info("Usuario con match exacto encontrado: %s", normalized)
+            logger.info("Seleccionando usuario con match exacto: %s", normalized)
             try:
                 await selection.scroll_into_view_if_needed(timeout=2_000)
                 await selection.click()
@@ -683,23 +696,85 @@ class HumanInstagramSender:
 
             clicked = False
             click_error: Exception | None = None
+
+            # 1. Buscar botón visible en el perfil
             dm_button = await find_profile_dm_button(page)
             if dm_button is not None:
                 try:
-                    logger.info("Clickeando boton de mensaje en perfil.")
-                    await dm_button.click()
-                    clicked = True
+                    if await dm_button.is_visible():
+                        logger.info("Clickeando botón de mensaje visible en perfil.")
+                        await dm_button.click()
+                        clicked = True
                 except Exception as exc:
+                    logger.debug("Fallo click en botón visible: %s", exc)
                     click_error = exc
 
+            # 2. Si no se encontró o no se pudo clickear, buscar en menú de tres puntos (⋯)
+            if not clicked:
+                logger.info("Botón directo no encontrado o falló. Probando menú de tres puntos (⋯).")
+                three_dots_selectors = [
+                    "svg[aria-label='More options']",
+                    "svg[aria-label='Más opciones']",
+                    "svg[aria-label='Options']",
+                    "svg[aria-label='Opciones']",
+                    "div[role='button']:has(svg[aria-label*='opcion'])",
+                    "div[role='button']:has(svg[aria-label*='option'])",
+                ]
+
+                three_dots = None
+                for sel in three_dots_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            three_dots = loc
+                            break
+                    except Exception:
+                        continue
+
+                if three_dots:
+                    try:
+                        await three_dots.click()
+                        await self._sleep(1, 2)
+
+                        # Buscar opción de "Enviar mensaje" en el diálogo abierto
+                        menu_options = [
+                            "span:has-text('Send message')",
+                            "span:has-text('Enviar mensaje')",
+                            "button:has-text('Send message')",
+                            "button:has-text('Enviar mensaje')",
+                            "div[role='button']:has-text('Send message')",
+                            "div[role='button']:has-text('Enviar mensaje')",
+                        ]
+
+                        option_found = False
+                        for opt_sel in menu_options:
+                            try:
+                                opt = page.locator(opt_sel).first
+                                if await opt.count() > 0 and await opt.is_visible():
+                                    logger.info("Opción 'Enviar mensaje' encontrada en menú de tres puntos.")
+                                    await opt.click()
+                                    option_found = True
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+
+                        if not option_found:
+                            # Cerrar el menú si no se encontró la opción (usualmente con Escape)
+                            await page.keyboard.press("Escape")
+                    except Exception as e:
+                        logger.debug("Error interactuando con menú de tres puntos: %s", e)
+
+            # 3. Verificación final de disponibilidad
             if not clicked:
                 availability = await detect_dm_availability(page)
                 if availability == DmAvailability.NO_DM:
                     logger.info(NO_DM_SKIP_LOG)
                     return NO_DM_SEND_METHOD
+
                 if click_error is not None:
-                    logger.debug("Error clickeando boton de mensaje: %s", click_error)
-                raise RuntimeError("No se encontro boton 'Enviar mensaje' en el perfil del usuario.")
+                    logger.debug("Error acumulado clickeando botón de mensaje: %s", click_error)
+                raise RuntimeError("No se encontró botón 'Enviar mensaje' ni en el perfil ni en el menú opcional.")
 
             try:
                 await page.wait_for_selector(", ".join(COMPOSERS), timeout=25_000)
