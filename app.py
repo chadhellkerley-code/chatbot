@@ -129,6 +129,7 @@ responder = _safe_import("responder")
 licensekit = _safe_import("licensekit")
 state_view = _safe_import("state_view")
 whatsapp = _safe_import("whatsapp")
+stats_engine = _safe_import("src.analytics.stats_engine")
 
 
 def _counts():
@@ -176,7 +177,7 @@ def current_menu_option_labels() -> list[str]:
         f"3) {em('💬')} Enviar mensajes",
         f"4) {em('📜')} Ver registros de envíos",
         f"5) {em('🤖')} Auto-responder con OpenAI",
-        f"6) {em('📊')} Estado de la conversación",
+        f"6) {em('📊')} Estadísticas y métricas",
         f"7) {em('📱')} Automatización por WhatsApp",
     ]
     if not SETTINGS.client_distribution:
@@ -222,9 +223,9 @@ def menu():
         elif op == "5" and responder:
             clear_console()
             responder.menu_autoresponder()
-        elif op == "6" and state_view:
+        elif op == "6" and stats_engine:
             clear_console()
-            state_view.menu_conversation_state()
+            stats_engine.run()
         elif op == "7" and whatsapp:
             clear_console()
             whatsapp.menu_whatsapp()
