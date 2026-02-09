@@ -240,9 +240,11 @@ class PlaywrightDMClient:
 
     def _row_selector_candidates(self) -> List[str]:
         return [
-            "a[href*='/direct/t/']",
             "div[aria-label='Chats'] div[role='button']",
             "div[aria-label='Mensajes'] div[role='button']",
+            "div[role='navigation'] div[role='button']",
+            "div[role='navigation'] a[href*='/direct/t/']",
+            "a[href*='/direct/t/']",
             "div[role='main'] div[role='listitem']",
             "div[role='main'] div[role='row']",
             "div[role='listitem']",
@@ -274,26 +276,24 @@ class PlaywrightDMClient:
         first_line = lines[0].strip()
         lowered = first_line.lower()
 
-        # [CRÍTICO] Un thread DM real DEBE tener un enlace a /direct/t/
-        # Las burbujas de Notas no suelen tener este enlace directo.
-        valid_href = False
+        # [CRÍTICO] Excluir sección de Notas (Stories de texto arriba del inbox)
+        # Notas suelen tener tokens específicos
+        notes_tokens = ("tu nota", "primera nota", "compartir una nota", "nota de", "feliz", "agradecido", "notas", "notes", "share a note")
+        if any(token in lowered for token in notes_tokens):
+            print(style_text(f"[Probe] Fila rechazada (filtro Notas texto): '{first_line[:30]}'", color=Fore.YELLOW))
+            return False
+
         try:
-            # 1. ¿El elemento mismo es el link?
-            href = row.get_attribute("href") or ""
-            if "/direct/t/" in href:
-                valid_href = True
-            # 2. ¿Contiene un link?
-            elif row.locator("a[href*='/direct/t/']").count() > 0:
-                valid_href = True
+            # Buscar si el elemento está dentro de un contenedor de Notas
+            # XPath para buscar ancestros con aria-label que mencione Notas
+            if row.locator("xpath=ancestor-or-self::div[contains(@aria-label, 'Notas') or contains(@aria-label, 'Notes')]").count() > 0:
+                print(style_text(f"[Probe] Fila rechazada (contenedor Notas aria): '{first_line[:30]}'", color=Fore.YELLOW))
+                return False
         except Exception:
             pass
 
-        if not valid_href:
-            print(style_text(f"[Probe] Fila rechazada (sin link DM): '{first_line[:30]}...'", color=Fore.YELLOW))
-            return False
-
         # Filtros de exclusión conocidos (headers, tabs, botones de búsqueda)
-        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje", "solicitudes", "principal"}:
+        if lowered in {"primary", "general", "request", "buscar", "search", "enviar mensaje", "solicitudes", "principal", "mensajes", "chats", "direct"}:
             print(style_text(f"[Probe] Fila rechazada (filtro texto): '{first_line}'", color=Fore.YELLOW))
             return False
 
@@ -336,9 +336,10 @@ class PlaywrightDMClient:
 
         # PROBE LOG: Para diagnosticar por qué se aceptan o rechazan filas
         if len(lines) >= 1:
-            # Si tiene al menos una línea y pasó los filtros críticos, es válido.
-            logger.debug("PlaywrightDM checking row: first_line=%s signals=%d", first_line[:30], signals)
-            print(style_text(f"[Probe] Fila aceptada: '{first_line}' (signals={signals})", color=Fore.GREEN))
+            # Si tiene al menos una línea y pasó los filtros críticos, lo marcamos como candidato.
+            # La verificación real de si es un thread ocurrirá al clickear (Click-First).
+            logger.debug("PlaywrightDM candidate found: first_line=%s signals=%d", first_line[:30], signals)
+            print(style_text(f"[Probe] Candidato aceptado para verificación: '{first_line[:40]}'", color=Fore.GREEN))
             return True
 
         logger.info("PlaywrightDM row_is_valid=False first_line=%s reason=no_content", first_line[:50])
@@ -364,7 +365,18 @@ class PlaywrightDMClient:
 
     def get_messages(self, thread: ThreadLike, amount: int = 20, *, log: bool = True) -> List[MessageLike]:
         page = self._ensure_page()
-        self._open_thread(thread)
+
+        # Click-First: Abrir y verificar thread antes de proceder
+        try:
+            opened = self._open_thread(thread)
+            if not opened:
+                if log:
+                    print(style_text(f"[Probe] Thread '{thread.title}' descartado: no abrió DM válido.", color=Fore.YELLOW))
+                return []
+        except Exception as e:
+            if log:
+                logger.warning("PlaywrightDM error al abrir thread %s: %s", thread.id, e)
+            return []
 
         # Esperar a que los mensajes se hidraten
         try:
@@ -683,13 +695,18 @@ class PlaywrightDMClient:
         except Exception:
             pass
 
-    def _open_thread(self, thread: ThreadLike) -> None:
+    def _open_thread(self, thread: ThreadLike) -> bool:
+        """
+        Abre un thread y verifica que sea válido.
+        Retorna True si el thread se abrió y el composer está visible.
+        """
         page = self._ensure_page()
 
         # PROBE: ¿Ya estamos en el thread correcto?
         if "/direct/t/" in (page.url or "") and thread.id in page.url:
             self._current_thread_id = thread.id
-            return
+            # Verificar de todos modos que haya composer
+            return self._wait_thread_open(page, timeout_ms=3000)
 
         opened = False
 
@@ -698,7 +715,7 @@ class PlaywrightDMClient:
             url = THREAD_URL_TEMPLATE.format(thread_id=thread.id)
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                opened = self._wait_thread_open(page, timeout_ms=5000)
+                opened = self._wait_thread_open(page, timeout_ms=6000)
             except Exception:
                 opened = False
 
@@ -715,8 +732,8 @@ class PlaywrightDMClient:
                 opened = False
 
         if not opened:
-            self.debug_dump_inbox("failed_to_open_thread")
-            raise RuntimeError(f"No se pudo abrir el thread '{thread.title}'")
+            logger.info("PlaywrightDM failed_to_open_thread title=%s", thread.title)
+            return False
 
         # Capturar y actualizar ID real en el objeto thread
         new_url = page.url or ""
@@ -741,6 +758,7 @@ class PlaywrightDMClient:
         self._current_thread_id = thread.id
         self._refresh_thread_participants(page, thread)
         logger.info("PlaywrightDM thread_abierto id=%s user=%s", thread.id, _thread_peer_id(thread, self.user_id))
+        return True
 
     def _collect_message_nodes(self, page: Page):
         container = None

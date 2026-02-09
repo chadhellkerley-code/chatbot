@@ -4864,12 +4864,13 @@ def _process_inbox(
         # 2. CAPTURAR CONTEXTO
         thread_id = str(thread.id)
         recipient_username = getattr(thread, "title", "unknown")
-        print(style_text(f"Thread {idx}/{total_threads} | open_thread recipient={recipient_username} thread_id={thread_id} OK", color=Fore.CYAN))
+        now_time_str = datetime.now().strftime("%H:%M")
+        print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – open_thread OK – {now_time_str}", color=Fore.CYAN))
 
         if not messages:
-            print(style_text(f"Thread {idx}/{total_threads} | captured messages=0", color=Fore.YELLOW))
+            print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – captured messages=0 – {now_time_str}", color=Fore.YELLOW))
             continue
-        print(style_text(f"Thread {idx}/{total_threads} | captured messages={len(messages)}", color=Fore.CYAN))
+        print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – captured messages={len(messages)} – {now_time_str}", color=Fore.CYAN))
 
         # 3. PERSISTENCIA INMEDIATA (Snapshot DOM)
         msgs_snapshot = [
@@ -4888,7 +4889,7 @@ def _process_inbox(
             "captured_at_epoch": time.time(),
             "messages": msgs_snapshot
         })
-        print(style_text(f"Thread {idx}/{total_threads} | persisted memory OK", color=Fore.GREEN))
+        print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – persisted memory OK – {now_time_str}", color=Fore.GREEN))
 
         if allowed_thread_ids is not None and thread_id not in allowed_thread_ids:
             continue
@@ -5046,7 +5047,7 @@ def _process_inbox(
             )
             now_time_str = datetime.now().strftime("%H:%M")
             if not can_send:
-                print(style_text(f"Thread {idx}/{total_threads} | bot_action=ignore at {now_time_str}", color=Fore.YELLOW))
+                print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – bot_action=ignore – {now_time_str}", color=Fore.YELLOW))
                 logger.info(
                     "Omitiendo envío para @%s → @%s: %s",
                     user,
@@ -5056,10 +5057,10 @@ def _process_inbox(
                 if last_id:
                     state[user][thread_id] = last_id
                 save_auto_state(state)
-                print(style_text(f"Thread {idx}/{total_threads} | done", color=Fore.CYAN))
+                print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – done – {now_time_str}", color=Fore.CYAN))
                 continue
 
-            print(style_text(f"Thread {idx}/{total_threads} | bot_action=respond at {now_time_str}", color=Fore.GREEN))
+            print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – bot_action=respond – {now_time_str}", color=Fore.GREEN))
             logger.info(
                 "Decision responder @%s thread=%s stage=%s reason=%s",
                 user,
@@ -5109,7 +5110,7 @@ def _process_inbox(
         index = stats.record_success(user)
         logger.info("Respuesta enviada por @%s en hilo %s (etapa: %s)", user, thread_id, stage)
         _print_response_summary(index, user, recipient_username, True, calendar_status_line)
-        print(style_text(f"Thread {idx}/{total_threads} | done", color=Fore.CYAN))
+        print(style_text(f"Thread {idx}/{total_threads} – {recipient_username} – done – {now_time_str}", color=Fore.CYAN))
     print(style_text(f"[Barrido] Scan completo para @{user}", color=Fore.GREEN))
 
 def _print_bot_summary(stats: BotStats) -> None:
