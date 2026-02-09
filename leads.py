@@ -221,7 +221,7 @@ def menu_leads():
         print("3) Ver lista")
         print("4) Eliminar lista")
         print("5) Gestionar plantillas")
-        print("6) Filtrado profesional de leads (IA)")
+        print("6) Filtrado de Leads")
         print("7) Volver\n")
         op=ask("Opcion: ").strip()
         if op=="1":
@@ -1004,8 +1004,8 @@ def _clip_filter(image_path: str, prompt: str) -> bool:
         # Si la probabilidad de que coincida con el prompt es mayor a la del fallback
         return probs[0][0] > 0.6 # Un poco más estricto
     except ImportError:
-        logging.warning("Bibliotecas CLIP/torch no encontradas. Saltando filtrado de imagen.")
-        return True
+        logging.error("Bibliotecas CLIP/torch no encontradas. No se puede realizar el filtrado de imagen solicitado.")
+        return False
     except Exception as e:
         logging.error(f"Error en el filtro CLIP: {e}")
         return False
@@ -1042,8 +1042,8 @@ def _deepface_filter(image_path: str, target_sex: str, min_age: int = 0, max_age
 
         return True
     except ImportError:
-        logging.warning("Biblioteca DeepFace no encontrada. Saltando filtrado por sexo/edad.")
-        return True
+        logging.error("Biblioteca DeepFace no encontrada. No se puede realizar el filtrado por sexo/edad solicitado.")
+        return False
     except Exception as e:
         logging.error(f"Error en el filtro DeepFace: {e}")
         return False
@@ -1452,8 +1452,10 @@ def _run_filtering_engine(accounts: List[Dict], usernames: List[str], config: Le
                     if config.profile_pic_prompt or config.target_sex != "indifferent":
                         pic_path = _download_profile_pic(profile_data.get("profile_pic_url", ""), username)
                         if not pic_path:
+                            print(f"      @{username} -> DESCARTADO (Etapa 3 - Sin foto de perfil)")
                             with results_lock:
                                 session.leads_disqualified.append(f"{username} (no photo)")
+                                if username in session.leads_pending: session.leads_pending.remove(username)
                                 session.leads_processed += 1
                                 save_filtering_session(session)
                             continue
