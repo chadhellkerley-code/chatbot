@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import platform
-import re
 import socket
 import sys
 import time
@@ -19,49 +18,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from runtime_parity import (
+    bootstrap_runtime_env,
+    format_runtime_preflight,
+    run_runtime_preflight,
+)
+
 
 def _initial_app_root() -> Path:
-    """Determina un directorio estable para guardar datos del cliente."""
-
-    candidates: List[Path] = []
+    """Devuelve una única raíz de datos para CLI y EXE."""
 
     if sys.argv and sys.argv[0]:
         try:
-            candidates.append(Path(os.path.abspath(sys.argv[0])).resolve().parent)
+            raw_entry = Path(os.path.abspath(sys.argv[0]))
+            if not raw_entry.exists():
+                raise FileNotFoundError(raw_entry)
+            entry = raw_entry.resolve()
+            base = entry.parent if entry.is_file() else entry
+            # En desarrollo, el EXE suele vivir en ./dist; usamos la raíz del proyecto.
+            if base.name.lower() == "dist":
+                parent = base.parent
+                if (parent / "app.py").exists():
+                    return parent
+            return base
         except Exception:
             pass
-
-    # Distribuciones congeladas (PyInstaller/zipapp) exponen ``sys.executable``
-    # apuntando al binario real en el bundle. Solo lo usamos cuando realmente
-    # estamos en modo congelado para evitar rutas del intérprete del sistema
-    # (por ejemplo, /usr/bin).
-    if getattr(sys, "frozen", False):
-        executable = getattr(sys, "executable", None)
-        if executable:
-            try:
-                candidates.append(Path(executable).resolve().parent)
-            except Exception:
-                pass
-
-    for candidate in candidates:
-        if candidate and candidate.exists():
-            return candidate
-
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        try:
-            return Path(meipass).resolve()
-        except Exception:
-            pass
-
     return Path(__file__).resolve().parent
 
 
 os.environ.setdefault("APP_DATA_ROOT", str(_initial_app_root()))
+bootstrap_runtime_env("client", app_root_hint=_initial_app_root(), force=True)
 
 def _get_app_root() -> Path:
     """Determina el directorio raiz del bundle/ejecutable."""
-
+    current = (os.environ.get("APP_DATA_ROOT") or "").strip()
+    if current:
+        return Path(current).expanduser()
     return _initial_app_root()
 
 
@@ -157,6 +149,25 @@ def _headless_exe_candidates(browser_dir: Path) -> List[Path]:
     return [browser_dir / "chrome-headless-shell" / "chrome-headless-shell"]
 
 
+def _standalone_chrome_candidates(root: Path) -> List[Path]:
+    if sys.platform.startswith("win"):
+        return [
+            root / "chrome-win64" / "chrome.exe",
+            root / "chrome-win" / "chrome.exe",
+            root / "browsers" / "chrome-win64" / "chrome.exe",
+            root / "browsers" / "chrome-win" / "chrome.exe",
+        ]
+    if sys.platform == "darwin":
+        return [
+            root / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+            root / "browsers" / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+        ]
+    return [
+        root / "chrome-linux" / "chrome",
+        root / "browsers" / "chrome-linux" / "chrome",
+    ]
+
+
 def _validate_executable(exe_path: Path) -> Tuple[bool, int]:
     size = _safe_stat_size(exe_path)
     if size <= _MIN_EXECUTABLE_BYTES:
@@ -176,11 +187,24 @@ def _select_executable(
     return None
 
 
+def _select_standalone_chrome(candidate: Path) -> Optional[Tuple[Path, int, str, Path]]:
+    for exe_path in _standalone_chrome_candidates(candidate):
+        ok, size = _validate_executable(exe_path)
+        if ok:
+            return exe_path, size, "standalone_chrome", exe_path.parent
+    return None
+
+
 def _select_playwright_root(
     candidate: Path,
 ) -> Optional[Tuple[Path, Path, int, str, Path]]:
     if not candidate.exists():
         return None
+
+    standalone = _select_standalone_chrome(candidate)
+    if standalone:
+        exe_path, size, reason, browser_dir = standalone
+        return candidate, exe_path, size, reason, browser_dir
 
     chromium_dir = _pick_latest_dir(candidate, _PLAYWRIGHT_CHROMIUM_PREFIX)
     if chromium_dir:
@@ -232,10 +256,24 @@ def _detect_playwright_browsers_path() -> Optional[Tuple[Path, Path, int, str, P
     candidates: List[Path] = []
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.extend([Path(base) / "playwright_browsers", Path(base) / "playwright"])
+        candidates.extend(
+            [
+                Path(base) / "playwright_browsers",
+                Path(base) / "playwright",
+                Path(base) / "browsers",
+                Path(base),
+            ]
+        )
 
     app_root = _get_app_root()
-    candidates.extend([app_root / "playwright_browsers", app_root / "playwright"])
+    candidates.extend(
+        [
+            app_root / "playwright_browsers",
+            app_root / "playwright",
+            app_root / "browsers",
+            app_root,
+        ]
+    )
 
     exe_parent = None
     try:
@@ -245,7 +283,14 @@ def _detect_playwright_browsers_path() -> Optional[Tuple[Path, Path, int, str, P
     except Exception:
         exe_parent = None
     if exe_parent:
-        candidates.extend([exe_parent / "playwright_browsers", exe_parent / "playwright"])
+        candidates.extend(
+            [
+                exe_parent / "playwright_browsers",
+                exe_parent / "playwright",
+                exe_parent / "browsers",
+                exe_parent,
+            ]
+        )
 
     for candidate in candidates:
         selection = _select_playwright_root(candidate)
@@ -260,14 +305,22 @@ def _ensure_playwright_browsers_env() -> Optional[Path]:
         selection = _select_playwright_root(Path(current).expanduser())
         if selection:
             root, exe_path, size, reason, browser_dir = selection
-            if str(root) != current:
+            os.environ["PLAYWRIGHT_CHROME_EXECUTABLE"] = str(exe_path)
+            if reason == "standalone_chrome":
+                os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            elif str(root) != current:
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
             _log_playwright_selection(root, browser_dir, exe_path, size, reason)
             return root
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
     selection = _detect_playwright_browsers_path()
     if selection:
         root, exe_path, size, reason, browser_dir = selection
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
+        os.environ["PLAYWRIGHT_CHROME_EXECUTABLE"] = str(exe_path)
+        if reason == "standalone_chrome":
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
         _log_playwright_selection(root, browser_dir, exe_path, size, reason)
         return root
     return None
@@ -287,13 +340,7 @@ SESSION_PATTERNS = [
     "v1_settings_*.json",
     "settings_*.json",
     "*.session.json",
-]
-
-CANDIDATE_SESSION_DIRS = [
-    "Station ID",
-    "session_id",
-    "station_id",
-    "Session ID",
+    "*.json",
 ]
 
 _DEBUG_ROOT_PRINTED = False
@@ -408,16 +455,6 @@ def _print_error(msg: str) -> None:
     print(msg)
     print(full_line(color=Fore.RED))
     print()
-
-
-def _slugify(value: str, fallback: str = "cliente") -> str:
-    value = (value or "").strip().lower()
-    if not value:
-        return fallback
-    value = value.replace(" ", "-")
-    value = re.sub(r"[^a-z0-9_-]+", "-", value)
-    value = value.strip("-")
-    return value or fallback
 
 
 def _storage_root() -> Path:
@@ -545,13 +582,8 @@ def _get_or_create_fingerprint() -> Tuple[str, Path, str]:
 
 
 def _resolve_sessions_dir() -> Path:
-    base_dir = _get_app_root()
-    for name in CANDIDATE_SESSION_DIRS:
-        candidate = base_dir / name
-        if candidate.is_dir():
-            candidate.mkdir(parents=True, exist_ok=True)
-            return candidate
-    target = base_dir / "Station ID"
+    root = Path(os.environ.get("APP_DATA_ROOT") or _get_app_root())
+    target = root / "storage" / "sessions"
     target.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -577,54 +609,15 @@ def _iter_session_files(sess_dir: Path) -> Iterable[Path]:
                 yield candidate
 
 
-def _migrate_legacy_data(app_root: Path, data_root: Path) -> None:
-    """Replica datos existentes cuando cambiamos el directorio base."""
-
-    if data_root == app_root:
-        return
-
-    legacy_candidates = [
-        app_root / "data",
-        app_root / "storage",
-        app_root / "conversation_state.db",
-    ]
-
-    for candidate in legacy_candidates:
-        try:
-            if not candidate.exists():
-                continue
-            target = data_root / candidate.name
-            if candidate.is_file():
-                if not target.exists():
-                    target.write_bytes(candidate.read_bytes())
-                continue
-            target.mkdir(parents=True, exist_ok=True)
-            for child in candidate.glob("**/*"):
-                if not child.is_file():
-                    continue
-                relative = child.relative_to(candidate)
-                destination = target / relative
-                if destination.exists():
-                    continue
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(child.read_bytes())
-        except Exception:
-            continue
-
-
 def _prepare_client_environment(record: Dict[str, str]) -> None:
-    alias = record.get("client_alias") or record.get("client_slug") or record.get("client_name")
-    alias = _slugify(alias)
+    _ = record
     app_root = _get_app_root()
-    sessions_root = _resolve_sessions_dir()
-    data_root = sessions_root / alias if alias else sessions_root
-    data_root.mkdir(parents=True, exist_ok=True)
-    _migrate_legacy_data(app_root, data_root)
     os.environ.setdefault("CLIENT_DISTRIBUTION", "1")
-    os.environ["CLIENT_SESSIONS_ROOT"] = str(sessions_root)
-    os.environ["CLIENT_ALIAS"] = alias
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
-    os.environ["APP_DATA_ROOT"] = str(data_root)
+    os.environ["APP_DATA_ROOT"] = str(app_root)
+    os.environ.pop("CLIENT_SESSIONS_ROOT", None)
+    os.environ.pop("CLIENT_ALIAS", None)
+    bootstrap_runtime_env("client", app_root_hint=app_root, force=True)
 
 
 def _client_integrity_marker_path() -> Path:
@@ -702,7 +695,9 @@ def _verify_playwright_bundle() -> None:
 
     resolved = _ensure_playwright_browsers_env()
     browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    chrome_executable = os.environ.get("PLAYWRIGHT_CHROME_EXECUTABLE", "").strip()
     print(style_text(f"PLAYWRIGHT_BROWSERS_PATH: {browsers_path or '-'}", color=Fore.WHITE))
+    print(style_text(f"PLAYWRIGHT_CHROME_EXECUTABLE: {chrome_executable or '-'}", color=Fore.WHITE))
     try:
         from playwright._impl import _driver
 
@@ -759,7 +754,7 @@ def _ensure_account_record(username: str, accounts: List[Dict]) -> Dict | None:
     except Exception:
         return None
 
-    alias = os.environ.get("CLIENT_ALIAS") or "default"
+    alias = "default"
     base_record = {
         "username": username,
         "alias": alias,
@@ -783,6 +778,7 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
     global _DEBUG_ROOT_PRINTED
 
     sessions_dir = _resolve_sessions_dir()
+    profiles_root = Path(os.environ.get("PROFILES_DIR") or (_get_app_root() / "profiles"))
     found_files = list(_iter_session_files(sessions_dir))
     print(f"📦 Sesiones detectadas en '{sessions_dir.name}': {len(found_files)}")
     try:
@@ -883,6 +879,16 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
             print(f"⚠️ Sesión de @{username} inválida, por favor volvé a iniciar sesión.")
             continue
 
+        storage_state = profiles_root / username / "storage_state.json"
+        if not storage_state.exists():
+            errors += 1
+            mark_connected(username, False)
+            print(
+                f"⚠️ Sesión de @{username} sin storage_state Playwright "
+                f"({storage_state}). Requiere relogin."
+            )
+            continue
+
         mark_connected(username, True)
         try:
             account["connected"] = True
@@ -944,6 +950,18 @@ def launch_with_license() -> None:
         _prepare_client_environment(record)
         config.refresh_settings()
         _load_sessions_on_boot()
+        preflight = run_runtime_preflight(
+            "client",
+            strict=False,
+            sync_connected=True,
+        )
+        print(format_runtime_preflight(preflight))
+        if int(preflight.get("critical_count", 0)) > 0:
+            _print_error(
+                "Preflight runtime falló con errores críticos. "
+                f"Revisa: {preflight.get('report_path')}"
+            )
+            sys.exit(2)
 
         _print_section("Licencia validada", color=Fore.GREEN)
         client = record.get("client_name", "Cliente")
@@ -993,6 +1011,18 @@ def launch_with_license() -> None:
     _prepare_client_environment(record)
     config.refresh_settings()
     _load_sessions_on_boot()
+    preflight = run_runtime_preflight(
+        "client",
+        strict=False,
+        sync_connected=True,
+    )
+    print(format_runtime_preflight(preflight))
+    if int(preflight.get("critical_count", 0)) > 0:
+        _print_error(
+            "Preflight runtime falló con errores críticos. "
+            f"Revisa: {preflight.get('report_path')}"
+        )
+        sys.exit(2)
 
     _print_section("Licencia validada", color=Fore.GREEN)
     client = record.get("client_name", "Cliente")

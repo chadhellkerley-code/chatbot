@@ -7,6 +7,14 @@ import importlib
 import os
 import time
 
+from runtime_parity import (
+    bootstrap_runtime_env,
+    format_runtime_preflight,
+    run_runtime_preflight,
+)
+
+bootstrap_runtime_env("owner")
+
 from config import SETTINGS
 from storage import sent_totals_today
 from ui import (
@@ -128,15 +136,35 @@ storage = _safe_import("storage")
 responder = _safe_import("responder")
 licensekit = _safe_import("licensekit")
 state_view = _safe_import("state_view")
+try:
+    # Static import so frozen builds (PyInstaller) don't miss this module.
+    from src.analytics import stats_engine as stats_engine  # type: ignore
+except Exception as e:
+    stats_engine = None
+    warn(f"Módulo no disponible o con error: src.analytics.stats_engine ({e})")
 whatsapp = _safe_import("whatsapp")
-stats_engine = _safe_import("src.analytics.stats_engine")
+_RUNTIME_PREFLIGHT_DONE = False
 
 
 def _counts():
     try:
         items = accounts.list_all()
         total = len(items)
-        connected = sum(1 for it in items if it.get("connected"))
+        resolver = getattr(accounts, "connected_status", None)
+        if callable(resolver):
+            connected = sum(
+                1
+                for it in items
+                if resolver(
+                    it,
+                    strict=False,
+                    reason="dashboard-count",
+                    fast=True,
+                    persist=False,
+                )
+            )
+        else:
+            connected = sum(1 for it in items if it.get("connected"))
         active = sum(1 for it in items if it.get("active"))
         return total, connected, active
     except Exception:
@@ -191,6 +219,22 @@ def current_menu_option_labels() -> list[str]:
 
 
 def menu():
+    global _RUNTIME_PREFLIGHT_DONE
+    if not _RUNTIME_PREFLIGHT_DONE:
+        runtime_mode = "client" if SETTINGS.client_distribution else "owner"
+        preflight = run_runtime_preflight(
+            runtime_mode,
+            strict=False,
+            sync_connected=True,
+        )
+        print(format_runtime_preflight(preflight))
+        if int(preflight.get("critical_count", 0)) > 0:
+            raise RuntimeError(
+                "Runtime preflight failed with critical issues. "
+                f"Report: {preflight.get('report_path')}"
+            )
+        _RUNTIME_PREFLIGHT_DONE = True
+
     if licensekit and hasattr(licensekit, "enforce_startup_validation"):
         licensekit.enforce_startup_validation()
     
@@ -225,7 +269,7 @@ def menu():
             responder.menu_autoresponder()
         elif op == "6" and stats_engine:
             clear_console()
-            stats_engine.run()
+            stats_engine.menu_stats()
         elif op == "7" and whatsapp:
             clear_console()
             whatsapp.menu_whatsapp()

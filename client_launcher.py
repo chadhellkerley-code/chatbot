@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from runtime_parity import bootstrap_runtime_env
+
 
 def _bootstrap_playwright_env() -> None:
     frozen = getattr(sys, "frozen", False)
@@ -44,6 +46,7 @@ def _bootstrap_playwright_env() -> None:
 
 
 _bootstrap_playwright_env()
+bootstrap_runtime_env("client")
 
 
 _PLAYWRIGHT_BROWSER_PREFIXES = (
