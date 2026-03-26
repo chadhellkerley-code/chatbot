@@ -1,5 +1,7 @@
 from __future__ import annotations
 import contextlib
+import threading
+import time
 from pathlib import Path
 
 from core.storage_atomic import atomic_write_json
@@ -325,3 +327,111 @@ def test_inbox_storage_seeds_preview_messages_without_dropping_cached_detail(tmp
         assert thread["needs_reply"] is True
     finally:
         storage.shutdown()
+
+
+def test_inbox_storage_update_thread_state_ignores_missing_thread(tmp_path: Path) -> None:
+    storage = InboxStorage(tmp_path)
+    try:
+        storage.update_thread_state("acc1:thread-missing", {"thread_status": "ready"})
+        assert storage.get_thread("acc1:thread-missing") is None
+    finally:
+        storage.shutdown()
+
+
+def test_inbox_storage_replace_messages_mark_read_bootstraps_thread_state(tmp_path: Path) -> None:
+    storage = InboxStorage(tmp_path)
+    try:
+        storage.replace_messages(
+            "acc1:thread-new",
+            [
+                {
+                    "message_id": "msg-1",
+                    "text": "hola",
+                    "timestamp": 100.0,
+                    "direction": "inbound",
+                }
+            ],
+            mark_read=True,
+            participants=["cliente_nuevo"],
+        )
+
+        thread = storage.get_thread("acc1:thread-new")
+        assert thread is not None
+        assert thread["thread_id"] == "thread-new"
+        assert thread["account_id"] == "acc1"
+        assert thread["unread_count"] == 0
+        snapshot = storage.snapshot()
+        assert snapshot["state"]["threads"]["acc1:thread-new"].get("last_opened_at")
+    finally:
+        storage.shutdown()
+
+
+def test_inbox_storage_cross_connection_state_writes_do_not_raise_fk(tmp_path: Path) -> None:
+    first = InboxStorage(tmp_path)
+    second = InboxStorage(tmp_path)
+    errors: list[tuple[str, str]] = []
+    stop_event = threading.Event()
+
+    try:
+        thread_key = "acc1:thread-race"
+        first.upsert_threads(
+            [
+                {
+                    "thread_key": thread_key,
+                    "thread_id": "thread-race",
+                    "thread_href": "/direct/t/thread-race/",
+                    "account_id": "acc1",
+                    "recipient_username": "cliente",
+                    "display_name": "Cliente",
+                }
+            ]
+        )
+
+        def _writer_state() -> None:
+            for index in range(250):
+                if stop_event.is_set():
+                    break
+                try:
+                    first.update_thread_state(thread_key, {"idx": index, "sender_status": "ready"})
+                except Exception as exc:
+                    errors.append((type(exc).__name__, str(exc)))
+                    stop_event.set()
+                    break
+
+        def _writer_delete_recreate() -> None:
+            for _index in range(250):
+                if stop_event.is_set():
+                    break
+                try:
+                    second.delete_thread(thread_key)
+                    second.upsert_threads(
+                        [
+                            {
+                                "thread_key": thread_key,
+                                "thread_id": "thread-race",
+                                "thread_href": "/direct/t/thread-race/",
+                                "account_id": "acc1",
+                                "recipient_username": "cliente",
+                                "display_name": "Cliente",
+                            }
+                        ]
+                    )
+                except Exception as exc:
+                    errors.append((type(exc).__name__, str(exc)))
+                    stop_event.set()
+                    break
+
+        left = threading.Thread(target=_writer_state)
+        right = threading.Thread(target=_writer_delete_recreate)
+        left.start()
+        right.start()
+        left.join(timeout=5.0)
+        right.join(timeout=5.0)
+        stop_event.set()
+        # Small drain window so both workers can observe stop and return cleanly.
+        time.sleep(0.05)
+
+        assert errors == []
+    finally:
+        first.shutdown()
+        second.shutdown()

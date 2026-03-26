@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -11,6 +12,9 @@ from src.inbox.message_sender import build_conversation_text
 
 from .browser_pool import BrowserPool
 from .conversation_store import ConversationStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(order=True)
@@ -237,9 +241,110 @@ class ConversationSender:
                     self._handle_send_message(task.payload)
                 elif task.task_type == "send_pack":
                     self._handle_send_pack(task.payload)
+            except Exception as exc:
+                try:
+                    self._handle_task_exception(task, exc)
+                except Exception:
+                    logger.exception(
+                        "Conversation sender failed while handling an unexpected task error"
+                    )
             finally:
                 self._active_task = ""
                 self._queue.task_done()
+
+    def _handle_task_exception(self, task: _SenderTask, error: Exception) -> None:
+        task_type = str(task.task_type or "").strip().lower()
+        payload = dict(task.payload or {})
+        thread_key = str(payload.get("thread_key") or "").strip()
+        local_message_id = str(payload.get("local_message_id") or "").strip()
+        job_id = int(payload.get("job_id") or 0)
+        error_text = str(error or "").strip() or error.__class__.__name__
+        logger.exception(
+            "Conversation sender task crashed | task_type=%s thread_key=%s job_id=%s",
+            task_type,
+            thread_key,
+            job_id,
+        )
+
+        account_id = ""
+        if thread_key:
+            try:
+                thread = self._store.get_thread(thread_key)
+            except Exception:
+                thread = None
+            if isinstance(thread, dict):
+                account_id = str(thread.get("account_id") or "").strip()
+
+        if task_type == "send_message":
+            if thread_key and local_message_id:
+                try:
+                    self._store.resolve_local_outbound(
+                        thread_key,
+                        local_message_id,
+                        error_message=error_text,
+                    )
+                except Exception:
+                    logger.debug("Could not mark local outbound message as failed", exc_info=True)
+            if job_id > 0:
+                try:
+                    self._store.update_send_queue_job(job_id, state="error", error_message=error_text)
+                except Exception:
+                    logger.debug("Could not mark send queue job as failed", exc_info=True)
+            if thread_key:
+                try:
+                    self._store.update_thread_state(
+                        thread_key,
+                        {
+                            "sender_status": "failed",
+                            "sender_error": error_text,
+                            "thread_error": error_text,
+                            "status": "error",
+                        },
+                    )
+                except Exception:
+                    logger.debug("Could not persist sender failure state for thread", exc_info=True)
+        elif task_type == "send_pack":
+            if job_id > 0:
+                try:
+                    self._store.update_send_queue_job(job_id, state="error", error_message=error_text)
+                except Exception:
+                    logger.debug("Could not mark pack job as failed", exc_info=True)
+            if thread_key:
+                try:
+                    self._store.update_thread_state(
+                        thread_key,
+                        {
+                            "pack_status": "failed",
+                            "pack_error": error_text,
+                            "sender_status": "failed",
+                            "sender_error": error_text,
+                            "status": "error",
+                        },
+                    )
+                except Exception:
+                    logger.debug("Could not persist pack failure state for thread", exc_info=True)
+        elif task_type == "prepare" and thread_key:
+            try:
+                self._store.update_thread_state(
+                    thread_key,
+                    {
+                        "thread_status": "failed",
+                        "thread_error": error_text,
+                        "sender_status": "failed",
+                        "sender_error": error_text,
+                    },
+                )
+            except Exception:
+                logger.debug("Could not persist prepare failure state for thread", exc_info=True)
+
+        try:
+            self._notifier(
+                reason="sender_worker_error",
+                thread_keys=[thread_key] if thread_key else [],
+                account_ids=[account_id] if account_id else [],
+            )
+        except Exception:
+            logger.debug("Could not emit sender worker error notification", exc_info=True)
 
     def _handle_prepare(self, payload: dict[str, Any]) -> None:
         thread_key = str(payload.get("thread_key") or "").strip()
